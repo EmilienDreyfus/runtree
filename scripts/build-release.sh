@@ -25,12 +25,20 @@ build_target() {
 	goarch="$2"
 	staging_dir=$(mktemp -d "${TMPDIR:-/tmp}/runtree-release.XXXXXX")
 	archive_name="runtree_${VERSION}_${goos}_${goarch}.tar.gz"
+	tunnel_var="TUNNEL_BINARY_$(printf '%s_%s' "$goos" "$goarch" | tr '[:lower:]/-' '[:upper:]___')"
 
 	GOCACHE="$GOCACHE" GOMODCACHE="$GOMODCACHE" CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
 		go build -trimpath -ldflags "$LD_FLAGS" -o "${staging_dir}/runtree" ./cmd/runtree
 
 	cp "$ROOT_DIR/README.md" "$ROOT_DIR/LICENSE" "$staging_dir/"
-	tar -C "$staging_dir" -czf "${OUT_DIR}/${archive_name}" runtree README.md LICENSE
+	eval "tunnel_binary=\${$tunnel_var:-}"
+	if [ -n "$tunnel_binary" ]; then
+		cp "$tunnel_binary" "${staging_dir}/cloudflared"
+		chmod 755 "${staging_dir}/cloudflared"
+		tar -C "$staging_dir" -czf "${OUT_DIR}/${archive_name}" runtree cloudflared README.md LICENSE
+	else
+		tar -C "$staging_dir" -czf "${OUT_DIR}/${archive_name}" runtree README.md LICENSE
+	fi
 	rm -rf "$staging_dir"
 }
 

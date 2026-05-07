@@ -10,6 +10,7 @@ RELEASES_URL="${RUNTREE_BASE_URL:-$DEFAULT_RELEASES_URL}"
 API_URL="${RUNTREE_API_BASE_URL:-$DEFAULT_API_URL}"
 INSTALL_DIR="${RUNTREE_INSTALL_DIR:-${HOME:-$PWD}/.local/bin}"
 REQUESTED_VERSION="${RUNTREE_VERSION:-}"
+RUNTREE_HOME_DIR="${RUNTREE_HOME:-${HOME:-$PWD}/.runtree}"
 
 usage() {
 	cat <<'EOF'
@@ -21,6 +22,7 @@ Usage:
 Environment:
   RUNTREE_VERSION      Release tag to install, for example v0.1.0
   RUNTREE_INSTALL_DIR  Target directory for the runtree binary
+  RUNTREE_HOME         Target directory for runtree local state and bundled helpers
   RUNTREE_BASE_URL     Override release asset base URL
   RUNTREE_API_BASE_URL Override release API base URL
 EOF
@@ -158,6 +160,15 @@ main() {
 	install_path="${INSTALL_DIR}/runtree"
 	cp "${tmp_dir}/runtree" "$install_path"
 	chmod 755 "$install_path"
+
+	if [ -f "${tmp_dir}/cloudflared" ]; then
+		tunnel_dir="${RUNTREE_HOME_DIR}/bin"
+		mkdir -p "$tunnel_dir"
+		tunnel_install_path="${tunnel_dir}/cloudflared"
+		cp "${tmp_dir}/cloudflared" "$tunnel_install_path"
+		chmod 755 "$tunnel_install_path"
+		log "installed tunnel helper to ${tunnel_install_path}"
+	fi
 
 	log "installed runtree ${version} to ${install_path}"
 	"$install_path" version

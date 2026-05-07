@@ -1,13 +1,16 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -15,11 +18,16 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/EmilienDreyfus/runtree/internal/app"
+	"github.com/EmilienDreyfus/runtree/internal/authflow"
+	"github.com/EmilienDreyfus/runtree/internal/authstore"
 	"github.com/EmilienDreyfus/runtree/internal/buildinfo"
+	"github.com/EmilienDreyfus/runtree/internal/cloudapi"
 	"github.com/EmilienDreyfus/runtree/internal/config"
+	"github.com/EmilienDreyfus/runtree/internal/expose"
 	"github.com/EmilienDreyfus/runtree/internal/openers"
 	"github.com/EmilienDreyfus/runtree/internal/settings"
 	"github.com/EmilienDreyfus/runtree/internal/state"
+	"github.com/EmilienDreyfus/runtree/internal/tunnel"
 )
 
 func NewRootCommand() *cobra.Command {
@@ -34,6 +42,8 @@ func NewRootCommand() *cobra.Command {
 	rootCmd.SetVersionTemplate("{{.Name}} {{.Version}}\n")
 
 	rootCmd.AddCommand(newInitCommand(service))
+	rootCmd.AddCommand(newLoginCommand())
+	rootCmd.AddCommand(newLogoutCommand())
 	rootCmd.AddCommand(newEditorCommand())
 	rootCmd.AddCommand(newScanCommand(service))
 	rootCmd.AddCommand(newListCommand(service))
@@ -44,9 +54,48 @@ func NewRootCommand() *cobra.Command {
 	rootCmd.AddCommand(newLogsCommand(service))
 	rootCmd.AddCommand(newWebCommand(service))
 	rootCmd.AddCommand(newCodeCommand(service))
+	rootCmd.AddCommand(newExposeCommand(service))
 	rootCmd.AddCommand(newVersionCommand())
 
 	return rootCmd
+}
+
+func newLoginCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "login",
+		Short: "Sign in to runtree cloud in your browser",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := cloudapi.NewClient(resolveCloudBaseURL(""), "")
+			service := authflow.Service{
+				BaseURL: resolveCloudBaseURL(""),
+				Client:  client,
+				OpenBrowser: func(target string) error {
+					spec, err := openers.ResolveBrowser(target)
+					if err != nil {
+						return err
+					}
+					return openers.Run(spec)
+				},
+			}
+			_, err := service.Login(cmd.Context(), cmd.OutOrStdout())
+			return err
+		},
+	}
+}
+
+func newLogoutCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "logout",
+		Short: "Clear the local runtree cloud session",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			service := authflow.Service{}
+			if err := service.Logout(); err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), "logged out")
+			return nil
+		},
+	}
 }
 
 func newVersionCommand() *cobra.Command {
@@ -422,6 +471,49 @@ func newCodeCommand(service app.Service) *cobra.Command {
 	}
 }
 
+func newExposeCommand(service app.Service) *cobra.Command {
+	return &cobra.Command{
+		Use:   "expose <instance>",
+		Short: "Expose an instance through runtree cloud",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			auth, err := authstore.Load("")
+			if err != nil {
+				return err
+			}
+			if strings.TrimSpace(auth.AccessToken) == "" {
+				return errors.New("not logged in: run `runtree login` first")
+			}
+
+			baseURL := resolveCloudBaseURL(auth.BaseURL)
+			client := cloudapi.NewClient(baseURL, auth.AccessToken)
+			controller := expose.Service{
+				App:    service,
+				Cloud:  client,
+				Runner: tunnel.Runner{},
+				Log:    cmd.ErrOrStderr(),
+				OnReady: func(state expose.RunState) {
+					fmt.Fprintf(cmd.OutOrStdout(), "public URL: %s\n", state.PublicURL)
+				},
+			}
+
+			ctx, stop := signalContext(cmd.Context())
+			defer stop()
+
+			err = controller.Run(ctx, mustGetwd(), args[0])
+			if err == nil || errors.Is(err, context.Canceled) {
+				return nil
+			}
+
+			var apiErr *cloudapi.APIError
+			if errors.As(err, &apiErr) && apiErr.UpgradeURL != "" {
+				return fmt.Errorf("%s\nupgrade: %s", apiErr.Message, apiErr.UpgradeURL)
+			}
+			return err
+		},
+	}
+}
+
 type surveyPrompter struct{}
 
 func (surveyPrompter) ReviewCandidate(candidate app.ScanCandidate) (bool, string, error) {
@@ -725,4 +817,18 @@ func mustGetwd() string {
 		panic(err)
 	}
 	return wd
+}
+
+func resolveCloudBaseURL(saved string) string {
+	if override := strings.TrimSpace(os.Getenv("RUNTREE_CLOUD_URL")); override != "" {
+		return override
+	}
+	if strings.TrimSpace(saved) != "" {
+		return saved
+	}
+	return cloudapi.DefaultBaseURL
+}
+
+func signalContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 }
