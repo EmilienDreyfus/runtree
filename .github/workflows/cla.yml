@@ -1,0 +1,26 @@
+name: CLA
+
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
+
+jobs:
+  cla:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate CLA acknowledgement
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.pull_request.body || "";
+            const acknowledged = /- \[x\] I have read and agree to the terms in \[CLA\.md\]\(\.\.\/CLA\.md\)\./i.test(body)
+              || /- \[x\] I have read and agree to the terms in CLA\.md\./i.test(body);
+
+            if (!acknowledged) {
+              core.setFailed("Pull requests must acknowledge CLA.md in the PR template.");
+            }

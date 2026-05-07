@@ -1,0 +1,27 @@
+name: Bug report
+description: Report a reproducible problem in runtree
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the bug and the expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include commands, repo state, and any logs that help reproduce the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Share your OS, architecture, runtree version, and runtime stack.
+    validations:
+      required: true
