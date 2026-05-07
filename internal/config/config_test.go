@@ -12,7 +12,7 @@ func TestWriteLoadAndFindConfig(t *testing.T) {
 
 	root := t.TempDir()
 	cfg := Default()
-	cfg.Project.Name = "goodays-api"
+	cfg.Project.Name = "newProject"
 	cfg.Run.Command = "uv run python manage.py runserver 127.0.0.1:{port}"
 
 	path := filepath.Join(root, FileName)
@@ -52,7 +52,7 @@ func TestValidateRequiresPortPlaceholder(t *testing.T) {
 	t.Parallel()
 
 	cfg := Default()
-	cfg.Project.Name = "goodays-api"
+	cfg.Project.Name = "newProject"
 	cfg.Run.Command = "uv run python manage.py runserver"
 
 	if err := cfg.Validate(); err == nil {

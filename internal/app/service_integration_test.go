@@ -26,7 +26,7 @@ func TestServiceLifecycleAcrossRealWorktrees(t *testing.T) {
 	service := NewService(stateHome)
 	service.PortChecker = func(int) bool { return true }
 	initInput := InitInput{
-		Name:           "goodays-api",
+		Name:           "newProject",
 		RunCommand:     `trap 'exit 0' TERM INT; printf "boot %s\n" "{port}"; while true; do printf "tick %s\n" "{port}"; sleep 1; done`,
 		PortStart:      8100,
 		PortEnd:        8199,
@@ -58,7 +58,7 @@ func TestServiceLifecycleAcrossRealWorktrees(t *testing.T) {
 
 	linkedWorktree := filepath.Join(t.TempDir(), "repo-auth")
 	runGit(t, repoRoot, "worktree", "add", linkedWorktree, "-b", "feat/auth-refactor")
-	cursorDetachedWorktree := filepath.Join(repoRoot, ".cursor", "worktrees", "goodays-api", "cbm")
+	cursorDetachedWorktree := filepath.Join(repoRoot, ".cursor", "worktrees", "newProject", "cbm")
 	runGit(t, repoRoot, "worktree", "add", "--detach", cursorDetachedWorktree, "HEAD")
 	seedLegacyCursorInstance(t, stateHome, ctx.Project, cursorDetachedWorktree)
 

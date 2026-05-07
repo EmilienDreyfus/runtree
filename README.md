@@ -116,7 +116,7 @@ Initialize `runtree` in an existing Git repository:
 
 ```bash
 runtree init \
-  --name goodays-api \
+  --name newProject \
   --run-command "npm run dev -- --port {port}"
 ```
 
