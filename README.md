@@ -43,10 +43,10 @@ So you can actually work in parallel:
 No containers. No preview deployment. No manual local orchestration.
 
 `runtree` is especially useful if you:
-- work with Git worktrees
-- run multiple branches at the same time
-- use Codex, Cursor, Claude Code, or other coding agents
-- want faster dev/PM feedback loops on local environments
+- dream about using Git worktrees without hating your local setup
+- need multiple branches running at the same time
+- delegate work to Codex, Cursor, Claude Code, or other coding agents
+- want faster PM and QA feedback without waiting for preview environments
 
 Today, `runtree` focuses on local orchestration.  
 Soon, `runtree expose` will make a local branch shareable through a stable public URL for review and QA.
