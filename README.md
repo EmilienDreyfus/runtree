@@ -4,17 +4,52 @@
   <img src="./assets/logo.png" alt="runtree logo" width="420">
 </p>
 
-> Run multiple realities of your codebase.
+> Make git worktrees actually usable.
 
-`runtree` is a local-first CLI for running several worktrees of the same repository side by side, with isolated ports, logs, and editor/browser entrypoints.
+`runtree` is a local-first CLI that lets you run multiple branches of the same project side by side without fighting your local setup.
 
-It is built for teams working with:
-- Git worktrees
-- AI coding agents
-- parallel feature branches
-- fast local review loops
+Git worktrees are powerful. In practice, they are annoying:
+- ports collide
+- run commands break
+- editor configs get weird
+- logs get mixed up
+- opening the right branch in the right browser tab is manual every time
 
-`runtree` is source-available and distributed as static binaries for macOS and Linux.
+`runtree` fixes that.
+
+You install it once in a project, it scans your worktrees, asks how to run the app, remembers your editor, and gives you a clean workflow:
+
+```bash
+runtree up main
+runtree up auth-refactor
+runtree web auth-refactor
+runtree code auth-refactor
+runtree logs auth-refactor
+```
+
+Each worktree gets:
+- its own port
+- its own runtime
+- its own logs
+- its own browser entrypoint
+- its own editor entrypoint
+
+So you can actually work in parallel:
+- one branch for a refactor
+- one branch for a fix
+- one branch being handled by an AI agent
+- one branch being reviewed locally
+
+No containers. No preview deployment. No manual local orchestration.
+
+`runtree` is especially useful if you:
+- work with Git worktrees
+- run multiple branches at the same time
+- use Codex, Cursor, Claude Code, or other coding agents
+- want faster dev/PM feedback loops on local environments
+
+Today, `runtree` focuses on local orchestration.  
+Soon, `runtree expose` will make a local branch shareable through a stable public URL for review and QA.
 
 ## Install
 
@@ -47,6 +82,33 @@ Verify the install:
 ```bash
 runtree version
 ```
+
+## Why This Exists
+
+Modern development is no longer:
+
+```text
+1 developer = 1 branch = 1 running app
+```
+
+It is increasingly:
+
+```text
+1 developer = multiple branches = multiple agents = multiple running instances
+```
+
+That is where the default local tooling falls apart.
+
+`runtree` is built for the moment where:
+- you launch one agent on branch A
+- you work yourself on branch B
+- you want both apps running at the same time
+- you do not want to waste time reconfiguring ports, terminals, editors, and logs
+
+It works just as well for:
+- a monolith with several parallel branches
+- a repo with many long-lived feature worktrees
+- a local stack where multiple services or libraries need to be launched independently
 
 ## Quickstart
 
@@ -99,6 +161,18 @@ Stop the runtime:
 ```bash
 runtree down main
 ```
+
+## What It Feels Like
+
+Without `runtree`, Git worktrees are technically available but awkward in practice.
+
+With `runtree`:
+- `runtree up <instance>` starts the right branch on the right port
+- `runtree web <instance>` opens the right browser target
+- `runtree code <instance>` opens the right worktree in your editor
+- `runtree logs <instance>` gives you the logs for that branch only
+
+That is the real value: making parallel local development usable, not just theoretically possible.
 
 ## What `runtree` manages
 
@@ -193,7 +267,12 @@ Planned, not available yet:
 - stable public URLs for shared previews
 - managed sharing infrastructure around `expose`
 
-The future `expose` capability and stable URLs are intended to be offered as a managed service outside the scope of this public repository.
+The future `expose` capability is the natural next step:
+- run a branch locally
+- share it instantly with a PM or teammate
+- avoid waiting for a feature environment or preview deployment
+
+Stable public URLs and the managed infrastructure behind `expose` are intended to be offered as a service outside the scope of this public repository.
 
 ## Contributing
 
