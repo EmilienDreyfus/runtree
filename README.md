@@ -1,5 +1,9 @@
 # runtree
 
+<p align="center">
+  <img src="./assets/logo.png" alt="runtree logo" width="420">
+</p>
+
 > Run multiple realities of your codebase.
 
 `runtree` is a local-first CLI for running several worktrees of the same repository side by side, with isolated ports, logs, and editor/browser entrypoints.
