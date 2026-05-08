@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/EmilienDreyfus/runtree/internal/config"
+	"github.com/EmilienDreyfus/runtree/internal/gitutil"
 	"github.com/EmilienDreyfus/runtree/internal/state"
 )
 
@@ -62,21 +63,18 @@ func TestServiceLifecycleAcrossRealWorktrees(t *testing.T) {
 	runGit(t, repoRoot, "worktree", "add", "--detach", cursorDetachedWorktree, "HEAD")
 	seedLegacyCursorInstance(t, stateHome, ctx.Project, cursorDetachedWorktree)
 
-	discovery, err := service.ScanProject(repoRoot, false, nil)
+	discovery, err := service.Inventory(repoRoot, false, false, nil)
 	if err != nil {
-		t.Fatalf("ScanProject(discovery) error = %v", err)
-	}
-	if !discovery.DiscoveryOnly {
-		t.Fatal("ScanProject(discovery).DiscoveryOnly = false, want true")
+		t.Fatalf("Inventory(discovery) error = %v", err)
 	}
 	if len(discovery.Imported) != 0 {
-		t.Fatalf("ScanProject(discovery).Imported = %d, want 0", len(discovery.Imported))
+		t.Fatalf("Inventory(discovery).Imported = %d, want 0", len(discovery.Imported))
 	}
 	if len(discovery.Candidates) != 2 {
-		t.Fatalf("ScanProject(discovery).Candidates = %d, want 2", len(discovery.Candidates))
+		t.Fatalf("Inventory(discovery).Candidates = %d, want 2", len(discovery.Candidates))
 	}
 	if len(discovery.Updated) == 0 {
-		t.Fatal("ScanProject(discovery).Updated = 0, want cursor legacy instance reclassified")
+		t.Fatal("Inventory(discovery).Updated = 0, want cursor legacy instance reclassified")
 	}
 	for _, candidate := range discovery.Candidates {
 		if candidate.WorktreePath == cursorDetachedWorktree {
@@ -84,12 +82,15 @@ func TestServiceLifecycleAcrossRealWorktrees(t *testing.T) {
 		}
 	}
 
-	imported, err := service.ScanProject(repoRoot, true, approveAllPrompter{})
+	imported, err := service.Inventory(repoRoot, false, true, importAllPrompter{})
 	if err != nil {
-		t.Fatalf("ScanProject(import) error = %v", err)
+		t.Fatalf("Inventory(import) error = %v", err)
 	}
 	if len(imported.Imported) != 2 {
-		t.Fatalf("ScanProject(import).Imported = %d, want 2", len(imported.Imported))
+		t.Fatalf("Inventory(import).Imported = %d, want 2", len(imported.Imported))
+	}
+	if len(imported.Instances) != 2 {
+		t.Fatalf("Inventory(import).Instances = %d, want 2", len(imported.Instances))
 	}
 
 	instances, err := service.ListInstances(repoRoot, false)
@@ -123,12 +124,12 @@ func TestServiceLifecycleAcrossRealWorktrees(t *testing.T) {
 		t.Fatalf("auth-refactor port = %d, want 8101", portsByName["auth-refactor"])
 	}
 
-	secondScan, err := service.ScanProject(repoRoot, true, approveAllPrompter{})
+	secondInventory, err := service.Inventory(repoRoot, false, true, importAllPrompter{})
 	if err != nil {
-		t.Fatalf("ScanProject(second) error = %v", err)
+		t.Fatalf("Inventory(second) error = %v", err)
 	}
-	if len(secondScan.Imported) != 0 || len(secondScan.Candidates) != 0 {
-		t.Fatalf("second scan imported=%d candidates=%d, want 0/0", len(secondScan.Imported), len(secondScan.Candidates))
+	if len(secondInventory.Imported) != 0 || len(secondInventory.Candidates) != 0 {
+		t.Fatalf("second inventory imported=%d candidates=%d, want 0/0", len(secondInventory.Imported), len(secondInventory.Candidates))
 	}
 
 	running, err := service.StartInstance(repoRoot, "auth-refactor")
@@ -171,8 +172,8 @@ func TestServiceLifecycleAcrossRealWorktrees(t *testing.T) {
 	}
 
 	runGit(t, repoRoot, "worktree", "remove", "--force", linkedWorktree)
-	if _, err := service.ScanProject(repoRoot, false, nil); err != nil {
-		t.Fatalf("ScanProject(after remove) error = %v", err)
+	if _, err := service.Inventory(repoRoot, false, false, nil); err != nil {
+		t.Fatalf("Inventory(after remove) error = %v", err)
 	}
 
 	instances, err = service.ListInstances(repoRoot, false)
@@ -227,12 +228,12 @@ func TestStartInstanceFailsWhenProcessExitsImmediately(t *testing.T) {
 		t.Fatalf("InitProject() error = %v", err)
 	}
 
-	imported, err := service.ScanProject(repoRoot, true, approveAllPrompter{})
+	imported, err := service.Inventory(repoRoot, false, true, importAllPrompter{})
 	if err != nil {
-		t.Fatalf("ScanProject() error = %v", err)
+		t.Fatalf("Inventory() error = %v", err)
 	}
 	if len(imported.Imported) != 1 {
-		t.Fatalf("ScanProject().Imported = %d, want 1", len(imported.Imported))
+		t.Fatalf("Inventory().Imported = %d, want 1", len(imported.Imported))
 	}
 
 	_, err = service.StartInstance(repoRoot, "main")
@@ -253,10 +254,97 @@ func TestStartInstanceFailsWhenProcessExitsImmediately(t *testing.T) {
 	}
 }
 
-type approveAllPrompter struct{}
+func TestInventoryImportsSelectedWorktreesOnly(t *testing.T) {
+	repoRoot := t.TempDir()
+	stateHome := filepath.Join(t.TempDir(), "state")
 
-func (approveAllPrompter) ReviewCandidate(candidate ScanCandidate) (bool, string, error) {
-	return true, candidate.SuggestedName, nil
+	runGit(t, repoRoot, "init", "-b", "main")
+	runGit(t, repoRoot, "config", "user.name", "Runtree Test")
+	runGit(t, repoRoot, "config", "user.email", "runtree@example.com")
+	writeFile(t, filepath.Join(repoRoot, "README.md"), "hello\n")
+	runGit(t, repoRoot, "add", "README.md")
+	runGit(t, repoRoot, "commit", "-m", "initial")
+
+	service := NewService(stateHome)
+	service.PortChecker = func(int) bool { return true }
+	if _, err := service.InitProject(repoRoot, InitInput{
+		Name:           "partial-import",
+		RunCommand:     `printf "boot {port}\n"`,
+		PortStart:      8100,
+		PortEnd:        8199,
+		WebURLTemplate: "http://127.0.0.1:{port}",
+	}); err != nil {
+		t.Fatalf("InitProject() error = %v", err)
+	}
+
+	authWorktree := filepath.Join(t.TempDir(), "repo-auth")
+	billingWorktree := filepath.Join(t.TempDir(), "repo-billing")
+	runGit(t, repoRoot, "worktree", "add", authWorktree, "-b", "feat/auth")
+	runGit(t, repoRoot, "worktree", "add", billingWorktree, "-b", "feat/billing")
+	canonicalAuthWorktree, err := gitutil.CanonicalPath(authWorktree)
+	if err != nil {
+		t.Fatalf("CanonicalPath(%s) error = %v", authWorktree, err)
+	}
+
+	result, err := service.Inventory(repoRoot, false, true, importPathsPrompter{
+		paths: map[string]string{
+			canonicalAuthWorktree: "auth",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Inventory(partial import) error = %v", err)
+	}
+	if len(result.Imported) != 1 || result.Imported[0].Name != "auth" {
+		t.Fatalf("Inventory(partial import).Imported = %+v, want auth only", result.Imported)
+	}
+	if len(result.Instances) != 1 {
+		t.Fatalf("Inventory(partial import).Instances = %d, want 1", len(result.Instances))
+	}
+
+	discovery, err := service.Inventory(repoRoot, false, false, nil)
+	if err != nil {
+		t.Fatalf("Inventory(discovery after partial import) error = %v", err)
+	}
+	if len(discovery.Candidates) != 2 {
+		t.Fatalf("Inventory(discovery after partial import).Candidates = %d, want 2", len(discovery.Candidates))
+	}
+	for _, candidate := range discovery.Candidates {
+		if candidate.WorktreePath == canonicalAuthWorktree {
+			t.Fatalf("imported worktree should not remain a candidate: %+v", candidate)
+		}
+	}
+}
+
+type importAllPrompter struct{}
+
+func (importAllPrompter) SelectImports(candidates []WorktreeCandidate) ([]ImportDecision, error) {
+	decisions := make([]ImportDecision, 0, len(candidates))
+	for _, candidate := range candidates {
+		decisions = append(decisions, ImportDecision{
+			WorktreePath: candidate.WorktreePath,
+			Name:         candidate.SuggestedName,
+		})
+	}
+	return decisions, nil
+}
+
+type importPathsPrompter struct {
+	paths map[string]string
+}
+
+func (p importPathsPrompter) SelectImports(candidates []WorktreeCandidate) ([]ImportDecision, error) {
+	decisions := []ImportDecision{}
+	for _, candidate := range candidates {
+		name, ok := p.paths[candidate.WorktreePath]
+		if !ok {
+			continue
+		}
+		decisions = append(decisions, ImportDecision{
+			WorktreePath: candidate.WorktreePath,
+			Name:         name,
+		})
+	}
+	return decisions, nil
 }
 
 func runGit(t *testing.T, dir string, args ...string) string {

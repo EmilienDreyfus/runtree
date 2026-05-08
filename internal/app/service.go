@@ -39,20 +39,27 @@ type InitInput struct {
 	WebURLTemplate string
 }
 
-type ScanCandidate struct {
+type WorktreeCandidate struct {
 	Branch        string
 	WorktreePath  string
 	SuggestedName string
 	ReservedNames []string
 	Port          int
+	source        string
+	visibility    string
 }
 
-type ScanResult struct {
-	Candidates    []ScanCandidate
-	Imported      []state.Instance
-	Updated       []state.Instance
-	Missing       []state.Instance
-	DiscoveryOnly bool
+type ImportDecision struct {
+	WorktreePath string
+	Name         string
+}
+
+type InventoryResult struct {
+	Instances  []state.Instance
+	Candidates []WorktreeCandidate
+	Imported   []state.Instance
+	Updated    []state.Instance
+	Missing    []state.Instance
 }
 
 type PruneResult struct {
@@ -60,8 +67,8 @@ type PruneResult struct {
 	SkippedRunning []state.Instance
 }
 
-type ScanPrompter interface {
-	ReviewCandidate(candidate ScanCandidate) (approved bool, name string, err error)
+type ImportPrompter interface {
+	SelectImports(candidates []WorktreeCandidate) ([]ImportDecision, error)
 }
 
 func NewService(homeDir string) Service {
@@ -126,21 +133,21 @@ func (s Service) InitProject(startDir string, input InitInput) (ProjectContext, 
 	}, nil
 }
 
-func (s Service) ScanProject(startDir string, interactive bool, prompter ScanPrompter) (ScanResult, error) {
+func (s Service) Inventory(startDir string, includeIgnored bool, importNew bool, prompter ImportPrompter) (InventoryResult, error) {
 	ctx, store, err := s.loadProject(startDir)
 	if err != nil {
-		return ScanResult{}, err
+		return InventoryResult{}, err
 	}
 	defer store.Close()
 
 	instances, err := s.reconcileInstances(store, ctx.Project.ID)
 	if err != nil {
-		return ScanResult{}, err
+		return InventoryResult{}, err
 	}
 
 	worktrees, err := gitutil.ListWorktrees(ctx.ConfigDir)
 	if err != nil {
-		return ScanResult{}, err
+		return InventoryResult{}, err
 	}
 
 	byPath := make(map[string]state.Instance, len(instances))
@@ -152,7 +159,7 @@ func (s Service) ScanProject(startDir string, interactive bool, prompter ScanPro
 		reservedPorts[instance.Port] = true
 	}
 
-	result := ScanResult{DiscoveryOnly: !interactive}
+	result := InventoryResult{}
 	seenPaths := make(map[string]bool, len(worktrees))
 	for _, worktree := range worktrees {
 		seenPaths[worktree.Path] = true
@@ -179,12 +186,12 @@ func (s Service) ScanProject(startDir string, interactive bool, prompter ScanPro
 			if worktree.Main && ctx.Project.MainWorktreePath != worktree.Path {
 				ctx.Project.MainWorktreePath = worktree.Path
 				if _, err := store.UpsertProject(ctx.Project); err != nil {
-					return ScanResult{}, err
+					return InventoryResult{}, err
 				}
 			}
 			if changed {
 				if err := store.UpdateInstance(instance); err != nil {
-					return ScanResult{}, err
+					return InventoryResult{}, err
 				}
 				result.Updated = append(result.Updated, instance)
 			}
@@ -197,64 +204,22 @@ func (s Service) ScanProject(startDir string, interactive bool, prompter ScanPro
 
 		port, err := ports.AllocateWithChecker(ctx.Config.Ports.Start, ctx.Config.Ports.End, reservedPorts, s.portChecker())
 		if err != nil {
-			return ScanResult{}, err
+			return InventoryResult{}, err
 		}
 		reservedPorts[port] = true
 
 		suggestedName := uniqueName(defaultName(worktree.Branch, worktree.Path), usedNames)
-		candidate := ScanCandidate{
+		candidate := WorktreeCandidate{
 			Branch:        worktree.Branch,
 			WorktreePath:  worktree.Path,
 			SuggestedName: suggestedName,
 			ReservedNames: sortedNames(usedNames),
 			Port:          port,
+			source:        source,
+			visibility:    visibility,
 		}
 		result.Candidates = append(result.Candidates, candidate)
-		if !interactive {
-			continue
-		}
-		if prompter == nil {
-			return ScanResult{}, errors.New("interactive scan requires a prompter")
-		}
-
-		approved, chosenName, err := prompter.ReviewCandidate(candidate)
-		if err != nil {
-			return ScanResult{}, err
-		}
-		if !approved {
-			continue
-		}
-
-		name := strings.TrimSpace(chosenName)
-		if name == "" {
-			name = suggestedName
-		}
-		if usedNames[name] {
-			return ScanResult{}, fmt.Errorf("instance name %q already exists", name)
-		}
-
-		instance := state.Instance{
-			ProjectID:    ctx.Project.ID,
-			Name:         name,
-			Branch:       worktree.Branch,
-			WorktreePath: worktree.Path,
-			Source:       source,
-			Visibility:   visibility,
-			Port:         port,
-			PID:          0,
-			Status:       state.StatusStopped,
-			LogPath:      store.LogPath(ctx.Project.Name, name),
-		}
-		if err := store.EnsureLogDir(ctx.Project.Name); err != nil {
-			return ScanResult{}, fmt.Errorf("ensure logs directory: %w", err)
-		}
-		instance, err = store.CreateInstance(instance)
-		if err != nil {
-			return ScanResult{}, err
-		}
-		usedNames[name] = true
-		byPath[instance.WorktreePath] = instance
-		result.Imported = append(result.Imported, instance)
+		usedNames[suggestedName] = true
 	}
 
 	for _, instance := range instances {
@@ -267,13 +232,97 @@ func (s Service) ScanProject(startDir string, interactive bool, prompter ScanPro
 				instance.PID = 0
 			}
 			if err := store.UpdateInstance(instance); err != nil {
-				return ScanResult{}, err
+				return InventoryResult{}, err
 			}
 			result.Missing = append(result.Missing, instance)
 		}
 	}
 
+	if importNew && len(result.Candidates) > 0 {
+		if prompter == nil {
+			return InventoryResult{}, errors.New("worktree import requires a prompter")
+		}
+		decisions, err := prompter.SelectImports(result.Candidates)
+		if err != nil {
+			return InventoryResult{}, err
+		}
+		imported, err := s.importWorktrees(store, ctx.Project, result.Candidates, instances, decisions)
+		if err != nil {
+			return InventoryResult{}, err
+		}
+		result.Imported = imported
+	}
+
+	instances, err = store.InstancesByProject(ctx.Project.ID)
+	if err != nil {
+		return InventoryResult{}, err
+	}
+	result.Instances = filterInstances(instances, includeIgnored)
 	return result, nil
+}
+
+func (s Service) importWorktrees(store *state.Store, project state.Project, candidates []WorktreeCandidate, instances []state.Instance, decisions []ImportDecision) ([]state.Instance, error) {
+	if len(decisions) == 0 {
+		return nil, nil
+	}
+
+	byPath := make(map[string]WorktreeCandidate, len(candidates))
+	for _, candidate := range candidates {
+		byPath[candidate.WorktreePath] = candidate
+	}
+
+	usedNames := make(map[string]bool, len(instances)+len(decisions))
+	for _, instance := range instances {
+		usedNames[instance.Name] = true
+	}
+
+	if err := store.EnsureLogDir(project.Name); err != nil {
+		return nil, fmt.Errorf("ensure logs directory: %w", err)
+	}
+
+	imported := make([]state.Instance, 0, len(decisions))
+	importedPaths := make(map[string]bool, len(decisions))
+	for _, decision := range decisions {
+		candidate, ok := byPath[decision.WorktreePath]
+		if !ok {
+			return nil, fmt.Errorf("unknown worktree candidate %s", decision.WorktreePath)
+		}
+		if importedPaths[decision.WorktreePath] {
+			return nil, fmt.Errorf("worktree candidate %s selected more than once", decision.WorktreePath)
+		}
+		importedPaths[decision.WorktreePath] = true
+
+		name := strings.TrimSpace(decision.Name)
+		if name == "" {
+			name = candidate.SuggestedName
+		}
+		if name == "" {
+			return nil, errors.New("instance name is required")
+		}
+		if usedNames[name] {
+			return nil, fmt.Errorf("instance name %q already exists", name)
+		}
+
+		instance := state.Instance{
+			ProjectID:    project.ID,
+			Name:         name,
+			Branch:       candidate.Branch,
+			WorktreePath: candidate.WorktreePath,
+			Source:       candidate.source,
+			Visibility:   candidate.visibility,
+			Port:         candidate.Port,
+			PID:          0,
+			Status:       state.StatusStopped,
+			LogPath:      store.LogPath(project.Name, name),
+		}
+		created, err := store.CreateInstance(instance)
+		if err != nil {
+			return nil, err
+		}
+		usedNames[name] = true
+		imported = append(imported, created)
+	}
+	return imported, nil
 }
 
 func (s Service) ListInstances(startDir string, includeIgnored bool) ([]state.Instance, error) {

@@ -60,3 +60,35 @@ func TestVersionFlagPrintsSummary(t *testing.T) {
 		t.Fatalf("--version output = %q", got)
 	}
 }
+
+func TestHelpDoesNotListScanCommand(t *testing.T) {
+	cmd := NewRootCommand()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stdout)
+	cmd.SetArgs([]string{"--help"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute(--help) error = %v", err)
+	}
+
+	if strings.Contains(stdout.String(), "scan") {
+		t.Fatalf("help output should not mention scan:\n%s", stdout.String())
+	}
+}
+
+func TestScanCommandIsUnknown(t *testing.T) {
+	cmd := NewRootCommand()
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stdout)
+	cmd.SetArgs([]string{"scan"})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("Execute(scan) error = nil, want unknown command")
+	}
+	if !strings.Contains(err.Error(), "unknown command") {
+		t.Fatalf("Execute(scan) error = %v, want unknown command", err)
+	}
+}

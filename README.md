@@ -120,13 +120,7 @@ runtree init \
   --run-command "npm run dev -- --port {port}"
 ```
 
-Import the current worktrees into `runtree` state:
-
-```bash
-runtree scan
-```
-
-List available instances:
+List available instances and import current worktrees:
 
 ```bash
 runtree ls
@@ -190,7 +184,6 @@ Persistent local state lives under `~/.runtree/`.
 
 Core commands:
 - `runtree init`
-- `runtree scan`
 - `runtree ls`
 - `runtree up <instance>`
 - `runtree down <instance>`

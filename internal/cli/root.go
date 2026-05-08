@@ -45,7 +45,6 @@ func NewRootCommand() *cobra.Command {
 	rootCmd.AddCommand(newLoginCommand())
 	rootCmd.AddCommand(newLogoutCommand())
 	rootCmd.AddCommand(newEditorCommand())
-	rootCmd.AddCommand(newScanCommand(service))
 	rootCmd.AddCommand(newListCommand(service))
 	rootCmd.AddCommand(newPruneCommand(service))
 	rootCmd.AddCommand(newUpCommand(service))
@@ -231,87 +230,46 @@ func newEditorCommand() *cobra.Command {
 	return cmd
 }
 
-func newScanCommand(service app.Service) *cobra.Command {
-	return &cobra.Command{
-		Use:   "scan",
-		Short: "Scan Git worktrees and import new runtree instances",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			interactive := isInteractive()
-			var prompter app.ScanPrompter
-			if interactive {
-				prompter = surveyPrompter{}
-			}
-
-			result, err := service.ScanProject(mustGetwd(), interactive, prompter)
-			if err != nil {
-				return err
-			}
-
-			out := cmd.OutOrStdout()
-			if len(result.Updated) > 0 {
-				for _, instance := range result.Updated {
-					fmt.Fprintf(out, "updated %s (%s)\n", instance.Name, instance.Branch)
-				}
-			}
-			if len(result.Missing) > 0 {
-				for _, instance := range result.Missing {
-					fmt.Fprintf(out, "missing %s (%s)\n", instance.Name, instance.WorktreePath)
-				}
-			}
-			if result.DiscoveryOnly {
-				if len(result.Candidates) == 0 {
-					fmt.Fprintln(out, "no unmanaged worktrees detected")
-					return nil
-				}
-				fmt.Fprintln(out, "discovered unmanaged worktrees:")
-				for _, candidate := range result.Candidates {
-					fmt.Fprintf(out, "- %s\t%s\t:%d\n", candidate.WorktreePath, candidate.SuggestedName, candidate.Port)
-				}
-				return nil
-			}
-
-			if len(result.Imported) == 0 {
-				fmt.Fprintln(out, "no new worktrees imported")
-				return nil
-			}
-
-			for _, instance := range result.Imported {
-				fmt.Fprintf(out, "imported %s (%s) on :%d\n", instance.Name, instance.WorktreePath, instance.Port)
-			}
-			return nil
-		},
-	}
-}
-
 func newListCommand(service app.Service) *cobra.Command {
 	var includeIgnored bool
 
 	cmd := &cobra.Command{
 		Use:   "ls",
-		Short: "List runtree instances for the current project",
+		Short: "List runtree instances and import new worktrees",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			instances, err := service.ListInstances(mustGetwd(), includeIgnored)
+			interactive := isInteractive()
+			var prompter app.ImportPrompter
+			if interactive {
+				prompter = surveyImportPrompter{out: cmd.OutOrStdout()}
+			}
+
+			result, err := service.Inventory(mustGetwd(), includeIgnored, interactive, prompter)
 			if err != nil {
 				return err
 			}
-			if len(instances) == 0 {
-				fmt.Fprintln(cmd.OutOrStdout(), "no instances")
-				return nil
+
+			out := cmd.OutOrStdout()
+			if len(result.Imported) > 0 {
+				fmt.Fprintf(out, "imported %d worktree%s\n\n", len(result.Imported), pluralS(len(result.Imported)))
 			}
 
-			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-			fmt.Fprintln(tw, "INSTANCE\tBRANCH\tSTATUS\tPORT\tPID\tWORKTREE")
-			for _, instance := range instances {
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%d\t%s\n",
-					instance.Name,
-					emptyDash(instance.Branch),
-					instance.Status,
-					instance.Port,
-					instance.PID,
-					instance.WorktreePath,
-				)
+			if len(result.Instances) == 0 {
+				fmt.Fprintln(out, "no instances")
+			} else if err := printInstances(out, result.Instances); err != nil {
+				return err
 			}
-			return tw.Flush()
+
+			remaining := remainingCandidates(result)
+			if len(remaining) > 0 && !interactive {
+				if len(result.Instances) > 0 {
+					fmt.Fprintln(out)
+				}
+				if err := printUnmanagedWorktrees(out, remaining); err != nil {
+					return err
+				}
+				fmt.Fprintln(out, "\nrun `runtree ls` in an interactive shell to import these worktrees")
+			}
+			return nil
 		},
 	}
 
@@ -514,42 +472,174 @@ func newExposeCommand(service app.Service) *cobra.Command {
 	}
 }
 
-type surveyPrompter struct{}
+type surveyImportPrompter struct {
+	out io.Writer
+}
 
-func (surveyPrompter) ReviewCandidate(candidate app.ScanCandidate) (bool, string, error) {
-	approved := false
-	confirm := &survey.Confirm{
-		Message: fmt.Sprintf("Import worktree %s (%s) on :%d?", filepath.Base(candidate.WorktreePath), emptyDash(candidate.Branch), candidate.Port),
-		Default: true,
-	}
-	if err := survey.AskOne(confirm, &approved); err != nil {
-		return false, "", err
-	}
-	if !approved {
-		return false, "", nil
+func (p surveyImportPrompter) SelectImports(candidates []app.WorktreeCandidate) ([]app.ImportDecision, error) {
+	if len(candidates) == 0 {
+		return nil, nil
 	}
 
+	if p.out != nil {
+		if err := printUnmanagedWorktrees(p.out, candidates); err != nil {
+			return nil, err
+		}
+		fmt.Fprintln(p.out)
+	}
+
+	const (
+		importAll = "Import all"
+		choose    = "Choose worktrees"
+		ignore    = "Ignore for now"
+	)
+
+	action := importAll
+	if err := survey.AskOne(&survey.Select{
+		Message: fmt.Sprintf("Found %d unmanaged worktree%s:", len(candidates), pluralS(len(candidates))),
+		Options: []string{importAll, choose, ignore},
+		Default: importAll,
+	}, &action); err != nil {
+		return nil, err
+	}
+
+	switch action {
+	case importAll:
+		decisions := make([]app.ImportDecision, 0, len(candidates))
+		for _, candidate := range candidates {
+			decisions = append(decisions, app.ImportDecision{
+				WorktreePath: candidate.WorktreePath,
+				Name:         candidate.SuggestedName,
+			})
+		}
+		return decisions, nil
+	case choose:
+		return promptImportSelection(candidates)
+	default:
+		return nil, nil
+	}
+}
+
+func promptImportSelection(candidates []app.WorktreeCandidate) ([]app.ImportDecision, error) {
+	labels := make([]string, 0, len(candidates))
+	byLabel := make(map[string]app.WorktreeCandidate, len(candidates))
+	for _, candidate := range candidates {
+		label := worktreeCandidateLabel(candidate)
+		labels = append(labels, label)
+		byLabel[label] = candidate
+	}
+
+	var selected []string
+	if err := survey.AskOne(&survey.MultiSelect{
+		Message: "Worktrees to import:",
+		Options: labels,
+	}, &selected); err != nil {
+		return nil, err
+	}
+
+	usedNames := map[string]bool{}
+	for _, reserved := range candidates[0].ReservedNames {
+		usedNames[reserved] = true
+	}
+
+	decisions := make([]app.ImportDecision, 0, len(selected))
+	for _, label := range selected {
+		candidate := byLabel[label]
+		name, err := promptInstanceName(candidate, usedNames)
+		if err != nil {
+			return nil, err
+		}
+		usedNames[name] = true
+		decisions = append(decisions, app.ImportDecision{
+			WorktreePath: candidate.WorktreePath,
+			Name:         name,
+		})
+	}
+	return decisions, nil
+}
+
+func promptInstanceName(candidate app.WorktreeCandidate, usedNames map[string]bool) (string, error) {
 	name := candidate.SuggestedName
-	prompt := &survey.Input{
-		Message: "Instance name:",
-		Default: candidate.SuggestedName,
-	}
 	validator := func(value any) error {
 		name := strings.TrimSpace(value.(string))
 		if name == "" {
 			return errors.New("instance name is required")
 		}
-		for _, reserved := range candidate.ReservedNames {
-			if reserved == name {
-				return fmt.Errorf("instance name %q already exists", name)
-			}
+		if usedNames[name] {
+			return fmt.Errorf("instance name %q already exists", name)
 		}
 		return nil
 	}
-	if err := survey.AskOne(prompt, &name, survey.WithValidator(validator)); err != nil {
-		return false, "", err
+	if err := survey.AskOne(&survey.Input{
+		Message: fmt.Sprintf("Instance name for %s:", filepath.Base(candidate.WorktreePath)),
+		Default: candidate.SuggestedName,
+	}, &name, survey.WithValidator(validator)); err != nil {
+		return "", err
 	}
-	return true, name, nil
+	return strings.TrimSpace(name), nil
+}
+
+func printInstances(out io.Writer, instances []state.Instance) error {
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "INSTANCE\tBRANCH\tSTATUS\tPORT\tPID\tWORKTREE")
+	for _, instance := range instances {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%d\t%s\n",
+			instance.Name,
+			emptyDash(instance.Branch),
+			instance.Status,
+			instance.Port,
+			instance.PID,
+			instance.WorktreePath,
+		)
+	}
+	return tw.Flush()
+}
+
+func printUnmanagedWorktrees(out io.Writer, candidates []app.WorktreeCandidate) error {
+	fmt.Fprintln(out, "unmanaged worktrees:")
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "WORKTREE\tBRANCH\tSUGGESTED\tPORT")
+	for _, candidate := range candidates {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\n",
+			candidate.WorktreePath,
+			emptyDash(candidate.Branch),
+			candidate.SuggestedName,
+			candidate.Port,
+		)
+	}
+	return tw.Flush()
+}
+
+func remainingCandidates(result app.InventoryResult) []app.WorktreeCandidate {
+	importedPaths := make(map[string]bool, len(result.Imported))
+	for _, instance := range result.Imported {
+		importedPaths[instance.WorktreePath] = true
+	}
+
+	remaining := make([]app.WorktreeCandidate, 0, len(result.Candidates)-len(importedPaths))
+	for _, candidate := range result.Candidates {
+		if importedPaths[candidate.WorktreePath] {
+			continue
+		}
+		remaining = append(remaining, candidate)
+	}
+	return remaining
+}
+
+func worktreeCandidateLabel(candidate app.WorktreeCandidate) string {
+	return fmt.Sprintf("%s (%s) -> %s :%d",
+		filepath.Base(candidate.WorktreePath),
+		emptyDash(candidate.Branch),
+		candidate.SuggestedName,
+		candidate.Port,
+	)
+}
+
+func pluralS(count int) string {
+	if count == 1 {
+		return ""
+	}
+	return "s"
 }
 
 func completeInitInput(input app.InitInput, interactive bool) (app.InitInput, error) {
