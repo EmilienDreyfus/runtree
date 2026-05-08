@@ -5,12 +5,16 @@ set -eu
 OWNER_REPO="EmilienDreyfus/runtree"
 DEFAULT_RELEASES_URL="https://github.com/${OWNER_REPO}/releases"
 DEFAULT_API_URL="https://api.github.com/repos/${OWNER_REPO}/releases"
+DEFAULT_CLOUDFLARED_RELEASES_URL="https://github.com/cloudflare/cloudflared/releases"
 
 RELEASES_URL="${RUNTREE_BASE_URL:-$DEFAULT_RELEASES_URL}"
 API_URL="${RUNTREE_API_BASE_URL:-$DEFAULT_API_URL}"
+CLOUDFLARED_RELEASES_URL="${RUNTREE_CLOUDFLARED_BASE_URL:-$DEFAULT_CLOUDFLARED_RELEASES_URL}"
+CLOUDFLARED_VERSION="${RUNTREE_CLOUDFLARED_VERSION:-latest}"
 INSTALL_DIR="${RUNTREE_INSTALL_DIR:-${HOME:-$PWD}/.local/bin}"
 REQUESTED_VERSION="${RUNTREE_VERSION:-}"
 RUNTREE_HOME_DIR="${RUNTREE_HOME:-${HOME:-$PWD}/.runtree}"
+INSTALL_TUNNEL="${RUNTREE_INSTALL_TUNNEL:-1}"
 
 usage() {
 	cat <<'EOF'
@@ -25,6 +29,9 @@ Environment:
   RUNTREE_HOME         Target directory for runtree local state and bundled helpers
   RUNTREE_BASE_URL     Override release asset base URL
   RUNTREE_API_BASE_URL Override release API base URL
+  RUNTREE_INSTALL_TUNNEL Set to 0 to skip installing the cloudflared helper
+  RUNTREE_CLOUDFLARED_VERSION  cloudflared version to install, default latest
+  RUNTREE_CLOUDFLARED_BASE_URL Override cloudflared release asset base URL
 EOF
 }
 
@@ -109,6 +116,69 @@ verify_checksum() {
 	[ "$expected" = "$actual" ] || fail "checksum mismatch for ${archive_name}"
 }
 
+cloudflared_asset_name() {
+	os="$1"
+	arch="$2"
+
+	case "${os}_${arch}" in
+		darwin_amd64) printf 'cloudflared-darwin-amd64.tgz' ;;
+		darwin_arm64) printf 'cloudflared-darwin-arm64.tgz' ;;
+		linux_amd64) printf 'cloudflared-linux-amd64' ;;
+		linux_arm64) printf 'cloudflared-linux-arm64' ;;
+		*) fail "unsupported cloudflared target: ${os}/${arch}" ;;
+	esac
+}
+
+cloudflared_url() {
+	asset_name="$1"
+	case "$CLOUDFLARED_VERSION" in
+		latest|"") printf '%s/latest/download/%s' "$CLOUDFLARED_RELEASES_URL" "$asset_name" ;;
+		*) printf '%s/download/%s/%s' "$CLOUDFLARED_RELEASES_URL" "$CLOUDFLARED_VERSION" "$asset_name" ;;
+	esac
+}
+
+install_tunnel_helper() {
+	tmp_dir="$1"
+	os="$2"
+	arch="$3"
+
+	if [ "$INSTALL_TUNNEL" = "0" ]; then
+		return
+	fi
+
+	tunnel_dir="${RUNTREE_HOME_DIR}/bin"
+	mkdir -p "$tunnel_dir"
+	tunnel_install_path="${tunnel_dir}/cloudflared"
+
+	if [ -f "${tmp_dir}/cloudflared" ]; then
+		cp "${tmp_dir}/cloudflared" "$tunnel_install_path"
+		chmod 755 "$tunnel_install_path"
+		log "installed tunnel helper to ${tunnel_install_path}"
+		return
+	fi
+
+	asset_name=$(cloudflared_asset_name "$os" "$arch")
+	asset_url=$(cloudflared_url "$asset_name")
+
+	case "$asset_name" in
+		*.tgz)
+			asset_path="${tmp_dir}/${asset_name}"
+			tunnel_extract_dir="${tmp_dir}/cloudflared-extract"
+			mkdir -p "$tunnel_extract_dir"
+			download "$asset_url" "$asset_path"
+			tar -xzf "$asset_path" -C "$tunnel_extract_dir"
+			[ -f "${tunnel_extract_dir}/cloudflared" ] || fail "cloudflared archive did not contain cloudflared binary"
+			cp "${tunnel_extract_dir}/cloudflared" "$tunnel_install_path"
+			;;
+		*)
+			download "$asset_url" "$tunnel_install_path"
+			;;
+	esac
+
+	chmod 755 "$tunnel_install_path"
+	log "installed tunnel helper to ${tunnel_install_path}"
+}
+
 main() {
 	need_cmd curl
 	need_cmd tar
@@ -161,14 +231,7 @@ main() {
 	cp "${tmp_dir}/runtree" "$install_path"
 	chmod 755 "$install_path"
 
-	if [ -f "${tmp_dir}/cloudflared" ]; then
-		tunnel_dir="${RUNTREE_HOME_DIR}/bin"
-		mkdir -p "$tunnel_dir"
-		tunnel_install_path="${tunnel_dir}/cloudflared"
-		cp "${tmp_dir}/cloudflared" "$tunnel_install_path"
-		chmod 755 "$tunnel_install_path"
-		log "installed tunnel helper to ${tunnel_install_path}"
-	fi
+	install_tunnel_helper "$tmp_dir" "$os" "$arch"
 
 	log "installed runtree ${version} to ${install_path}"
 	"$install_path" version

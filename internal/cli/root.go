@@ -442,6 +442,9 @@ func newExposeCommand(service app.Service) *cobra.Command {
 			if strings.TrimSpace(auth.AccessToken) == "" {
 				return errors.New("not logged in: run `runtree login` first")
 			}
+			if _, err := tunnel.ResolveBinaryPath(""); err != nil {
+				return err
+			}
 
 			baseURL := resolveCloudBaseURL(auth.BaseURL)
 			client := cloudapi.NewClient(baseURL, auth.AccessToken)
