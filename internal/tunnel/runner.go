@@ -136,12 +136,12 @@ func (r Runner) stdout() io.Writer {
 	if r.Stdout != nil {
 		return r.Stdout
 	}
-	return os.Stdout
+	return io.Discard
 }
 
 func (r Runner) stderr() io.Writer {
 	if r.Stderr != nil {
 		return r.Stderr
 	}
-	return os.Stderr
+	return io.Discard
 }

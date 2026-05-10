@@ -430,7 +430,8 @@ func newCodeCommand(service app.Service) *cobra.Command {
 }
 
 func newExposeCommand(service app.Service) *cobra.Command {
-	return &cobra.Command{
+	var tunnelLogs bool
+	cmd := &cobra.Command{
 		Use:   "expose <instance>",
 		Short: "Expose an instance through runtree cloud",
 		Args:  cobra.ExactArgs(1),
@@ -448,10 +449,15 @@ func newExposeCommand(service app.Service) *cobra.Command {
 
 			baseURL := resolveCloudBaseURL(auth.BaseURL)
 			client := cloudapi.NewClient(baseURL, auth.AccessToken)
+			runner := tunnel.Runner{}
+			if tunnelLogs {
+				runner.Stdout = cmd.OutOrStdout()
+				runner.Stderr = cmd.ErrOrStderr()
+			}
 			controller := expose.Service{
 				App:    service,
 				Cloud:  client,
-				Runner: tunnel.Runner{},
+				Runner: runner,
 				Log:    cmd.ErrOrStderr(),
 				OnReady: func(state expose.RunState) {
 					fmt.Fprintf(cmd.OutOrStdout(), "public URL: %s\n", state.PublicURL)
@@ -473,6 +479,8 @@ func newExposeCommand(service app.Service) *cobra.Command {
 			return err
 		},
 	}
+	cmd.Flags().BoolVar(&tunnelLogs, "tunnel-logs", false, "stream tunnel provider logs")
+	return cmd
 }
 
 type surveyImportPrompter struct {
