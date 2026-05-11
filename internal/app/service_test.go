@@ -8,6 +8,27 @@ import (
 	"github.com/EmilienDreyfus/runtree/internal/gitutil"
 )
 
+func TestReservedInstanceNameAll(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"all", " All ", "ALL"} {
+		if !IsReservedInstanceName(name) {
+			t.Fatalf("IsReservedInstanceName(%q) = false, want true", name)
+		}
+	}
+	if IsReservedInstanceName("alloy") {
+		t.Fatal("IsReservedInstanceName(\"alloy\") = true, want false")
+	}
+}
+
+func TestUniqueNameSkipsReservedAllTarget(t *testing.T) {
+	t.Parallel()
+
+	if got := uniqueName("all", reservedInstanceNameSet()); got != "all-2" {
+		t.Fatalf("uniqueName(all) = %q, want all-2", got)
+	}
+}
+
 func TestClassifyWorktree(t *testing.T) {
 	t.Parallel()
 

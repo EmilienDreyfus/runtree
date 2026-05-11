@@ -126,10 +126,27 @@ List available instances and import current worktrees:
 runtree ls
 ```
 
+When `runtree ls` imports a worktree, it detects ignored top-level runtime files
+such as `.env` and `.env.local` from the main worktree. If they are missing from
+the imported worktree, runtree can symlink or copy them during import.
+
 Start an instance:
 
 ```bash
 runtree up main
+```
+
+Start every visible instance:
+
+```bash
+runtree start all
+```
+
+Run a one-off command in an instance worktree:
+
+```bash
+runtree run main -- npm install
+runtree run main -- poetry run python manage.py migrate
 ```
 
 Open it in the browser:
@@ -162,6 +179,7 @@ Without `runtree`, Git worktrees are technically available but awkward in practi
 
 With `runtree`:
 - `runtree up <instance>` starts the right branch on the right port
+- `runtree start all` starts every visible instance
 - `runtree web <instance>` opens the right browser target
 - `runtree code <instance>` opens the right worktree in your editor
 - `runtree logs <instance>` gives you the logs for that branch only
@@ -185,9 +203,10 @@ Persistent local state lives under `~/.runtree/`.
 Core commands:
 - `runtree init`
 - `runtree ls`
-- `runtree up <instance>`
-- `runtree down <instance>`
-- `runtree restart <instance>`
+- `runtree up <instance|all>`
+- `runtree run <instance> -- <command> [args...]`
+- `runtree down <instance|all>`
+- `runtree restart <instance|all>`
 - `runtree logs <instance>`
 - `runtree web <instance>`
 - `runtree code <instance>`

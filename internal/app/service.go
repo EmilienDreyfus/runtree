@@ -4,7 +4,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -21,6 +23,12 @@ type Service struct {
 	HomeDir     string
 	Runtime     runtime.Manager
 	PortChecker func(int) bool
+}
+
+const AllInstancesTarget = "all"
+
+func IsReservedInstanceName(name string) bool {
+	return strings.EqualFold(strings.TrimSpace(name), AllInstancesTarget)
 }
 
 type ProjectContext struct {
@@ -45,6 +53,7 @@ type WorktreeCandidate struct {
 	SuggestedName string
 	ReservedNames []string
 	Port          int
+	RuntimeFiles  []RuntimeFileCandidate
 	source        string
 	visibility    string
 }
@@ -52,19 +61,58 @@ type WorktreeCandidate struct {
 type ImportDecision struct {
 	WorktreePath string
 	Name         string
+	RuntimeFiles []RuntimeFileDecision
 }
 
 type InventoryResult struct {
-	Instances  []state.Instance
-	Candidates []WorktreeCandidate
-	Imported   []state.Instance
-	Updated    []state.Instance
-	Missing    []state.Instance
+	Instances          []state.Instance
+	Candidates         []WorktreeCandidate
+	RuntimeFileTargets []RuntimeFileTarget
+	Imported           []state.Instance
+	Updated            []state.Instance
+	Missing            []state.Instance
 }
 
 type PruneResult struct {
 	Pruned         []state.Instance
 	SkippedRunning []state.Instance
+}
+
+type RunCommandInput struct {
+	Args   []string
+	Stdin  io.Reader
+	Stdout io.Writer
+	Stderr io.Writer
+}
+
+type RuntimeFileAction string
+
+const (
+	RuntimeFileSkip    RuntimeFileAction = "skip"
+	RuntimeFileSymlink RuntimeFileAction = "symlink"
+	RuntimeFileCopy    RuntimeFileAction = "copy"
+)
+
+type RuntimeFileCandidate struct {
+	Path       string
+	SourcePath string
+	TargetPath string
+}
+
+type RuntimeFileDecision struct {
+	Path   string
+	Action RuntimeFileAction
+}
+
+type RuntimeFileTarget struct {
+	InstanceName string
+	WorktreePath string
+	RuntimeFiles []RuntimeFileCandidate
+}
+
+type RuntimeFileTargetDecision struct {
+	WorktreePath string
+	RuntimeFiles []RuntimeFileDecision
 }
 
 type ImportPrompter interface {
@@ -149,9 +197,16 @@ func (s Service) Inventory(startDir string, includeIgnored bool, importNew bool,
 	if err != nil {
 		return InventoryResult{}, err
 	}
+	if mainWorktreePath := mainWorktreePath(worktrees); mainWorktreePath != "" && ctx.Project.MainWorktreePath != mainWorktreePath {
+		ctx.Project.MainWorktreePath = mainWorktreePath
+		if _, err := store.UpsertProject(ctx.Project); err != nil {
+			return InventoryResult{}, err
+		}
+	}
+	runtimeFiles := discoverRuntimeFiles(ctx.Project.MainWorktreePath)
 
 	byPath := make(map[string]state.Instance, len(instances))
-	usedNames := make(map[string]bool, len(instances))
+	usedNames := reservedInstanceNameSet()
 	reservedPorts := make(map[int]bool, len(instances))
 	for _, instance := range instances {
 		byPath[instance.WorktreePath] = instance
@@ -183,12 +238,6 @@ func (s Service) Inventory(startDir string, includeIgnored bool, importNew bool,
 				instance.Visibility = visibility
 				changed = true
 			}
-			if worktree.Main && ctx.Project.MainWorktreePath != worktree.Path {
-				ctx.Project.MainWorktreePath = worktree.Path
-				if _, err := store.UpsertProject(ctx.Project); err != nil {
-					return InventoryResult{}, err
-				}
-			}
 			if changed {
 				if err := store.UpdateInstance(instance); err != nil {
 					return InventoryResult{}, err
@@ -215,6 +264,7 @@ func (s Service) Inventory(startDir string, includeIgnored bool, importNew bool,
 			SuggestedName: suggestedName,
 			ReservedNames: sortedNames(usedNames),
 			Port:          port,
+			RuntimeFiles:  missingRuntimeFiles(worktree.Path, runtimeFiles),
 			source:        source,
 			visibility:    visibility,
 		}
@@ -258,6 +308,11 @@ func (s Service) Inventory(startDir string, includeIgnored bool, importNew bool,
 		return InventoryResult{}, err
 	}
 	result.Instances = filterInstances(instances, includeIgnored)
+	excludedRuntimeTargets := make(map[string]bool, len(result.Imported))
+	for _, instance := range result.Imported {
+		excludedRuntimeTargets[instance.WorktreePath] = true
+	}
+	result.RuntimeFileTargets = runtimeFileTargets(result.Instances, runtimeFiles, excludedRuntimeTargets)
 	return result, nil
 }
 
@@ -271,7 +326,7 @@ func (s Service) importWorktrees(store *state.Store, project state.Project, cand
 		byPath[candidate.WorktreePath] = candidate
 	}
 
-	usedNames := make(map[string]bool, len(instances)+len(decisions))
+	usedNames := reservedInstanceNameSet()
 	for _, instance := range instances {
 		usedNames[instance.Name] = true
 	}
@@ -299,8 +354,14 @@ func (s Service) importWorktrees(store *state.Store, project state.Project, cand
 		if name == "" {
 			return nil, errors.New("instance name is required")
 		}
+		if IsReservedInstanceName(name) {
+			return nil, fmt.Errorf("instance name %q is reserved", name)
+		}
 		if usedNames[name] {
 			return nil, fmt.Errorf("instance name %q already exists", name)
+		}
+		if err := applyRuntimeFileDecisions(candidate, decision.RuntimeFiles); err != nil {
+			return nil, err
 		}
 
 		instance := state.Instance{
@@ -455,6 +516,77 @@ func (s Service) InstanceDetails(startDir, name string) (ProjectContext, state.I
 	return ctx, instance, nil
 }
 
+func (s Service) RunInInstance(startDir, name string, input RunCommandInput) error {
+	if len(input.Args) == 0 {
+		return errors.New("command is required")
+	}
+	ctx, instance, err := s.InstanceDetails(startDir, name)
+	if err != nil {
+		return err
+	}
+	if instance.Status == state.StatusMissing {
+		return fmt.Errorf("instance %s is missing its worktree", instance.Name)
+	}
+
+	cmd := exec.Command(input.Args[0], input.Args[1:]...)
+	cmd.Dir = instance.WorktreePath
+	cmd.Env = runtime.InstanceEnv(os.Environ(), ctx.Project.Name, instance.Name, instance.Port)
+	cmd.Stdin = input.Stdin
+	cmd.Stdout = input.Stdout
+	cmd.Stderr = input.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("run %s: %w", input.Args[0], err)
+	}
+	return nil
+}
+
+func (s Service) ConfigureRuntimeFiles(startDir string, decisions []RuntimeFileTargetDecision) ([]RuntimeFileTarget, error) {
+	if len(decisions) == 0 {
+		return nil, nil
+	}
+	ctx, store, err := s.loadProject(startDir)
+	if err != nil {
+		return nil, err
+	}
+	defer store.Close()
+
+	instances, err := s.reconcileInstances(store, ctx.Project.ID)
+	if err != nil {
+		return nil, err
+	}
+	worktrees, err := gitutil.ListWorktrees(ctx.ConfigDir)
+	if err != nil {
+		return nil, err
+	}
+	if mainWorktreePath := mainWorktreePath(worktrees); mainWorktreePath != "" {
+		ctx.Project.MainWorktreePath = mainWorktreePath
+	}
+	runtimeFiles := discoverRuntimeFiles(ctx.Project.MainWorktreePath)
+	targets := runtimeFileTargets(instances, runtimeFiles, nil)
+
+	targetsByPath := make(map[string]RuntimeFileTarget, len(targets))
+	for _, target := range targets {
+		targetsByPath[target.WorktreePath] = target
+	}
+
+	configured := make([]RuntimeFileTarget, 0, len(decisions))
+	for _, decision := range decisions {
+		target, ok := targetsByPath[decision.WorktreePath]
+		if !ok {
+			return nil, fmt.Errorf("unknown runtime file target %s", decision.WorktreePath)
+		}
+		candidate := WorktreeCandidate{
+			WorktreePath: target.WorktreePath,
+			RuntimeFiles: target.RuntimeFiles,
+		}
+		if err := applyRuntimeFileDecisions(candidate, decision.RuntimeFiles); err != nil {
+			return nil, err
+		}
+		configured = append(configured, target)
+	}
+	return configured, nil
+}
+
 func (s Service) PruneInstances(startDir string) (PruneResult, error) {
 	ctx, store, err := s.loadProject(startDir)
 	if err != nil {
@@ -482,6 +614,204 @@ func (s Service) PruneInstances(startDir string) (PruneResult, error) {
 		result.Pruned = append(result.Pruned, instance)
 	}
 	return result, nil
+}
+
+func mainWorktreePath(worktrees []gitutil.Worktree) string {
+	for _, worktree := range worktrees {
+		if worktree.Main {
+			return worktree.Path
+		}
+	}
+	return ""
+}
+
+func discoverRuntimeFiles(mainWorktreePath string) []RuntimeFileCandidate {
+	if strings.TrimSpace(mainWorktreePath) == "" {
+		return nil
+	}
+
+	matches, err := filepath.Glob(filepath.Join(mainWorktreePath, ".env*"))
+	if err != nil {
+		return nil
+	}
+	envrc := filepath.Join(mainWorktreePath, ".envrc")
+	if _, err := os.Stat(envrc); err == nil {
+		matches = append(matches, envrc)
+	}
+	sort.Strings(matches)
+
+	files := make([]RuntimeFileCandidate, 0, len(matches))
+	seen := map[string]bool{}
+	for _, sourcePath := range matches {
+		rel, err := filepath.Rel(mainWorktreePath, sourcePath)
+		if err != nil || !isRuntimeFileName(rel) || seen[rel] {
+			continue
+		}
+		if !isIgnoredFile(mainWorktreePath, rel) {
+			continue
+		}
+		info, err := os.Stat(sourcePath)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		seen[rel] = true
+		files = append(files, RuntimeFileCandidate{
+			Path:       rel,
+			SourcePath: sourcePath,
+		})
+	}
+	return files
+}
+
+func isRuntimeFileName(path string) bool {
+	base := filepath.Base(path)
+	if path != base {
+		return false
+	}
+	lowerBase := strings.ToLower(base)
+	if lowerBase == ".envrc" {
+		return true
+	}
+	if !strings.HasPrefix(lowerBase, ".env") {
+		return false
+	}
+	if strings.Contains(lowerBase, "example") || strings.Contains(lowerBase, "sample") || strings.Contains(lowerBase, "template") {
+		return false
+	}
+	return true
+}
+
+func isIgnoredFile(worktreePath, relPath string) bool {
+	cmd := exec.Command("git", "-C", worktreePath, "check-ignore", "-q", "--", relPath)
+	return cmd.Run() == nil
+}
+
+func missingRuntimeFiles(worktreePath string, files []RuntimeFileCandidate) []RuntimeFileCandidate {
+	if len(files) == 0 {
+		return nil
+	}
+
+	missing := make([]RuntimeFileCandidate, 0, len(files))
+	for _, file := range files {
+		targetPath := filepath.Join(worktreePath, file.Path)
+		if _, err := os.Lstat(targetPath); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		file.TargetPath = targetPath
+		missing = append(missing, file)
+	}
+	return missing
+}
+
+func runtimeFileTargets(instances []state.Instance, files []RuntimeFileCandidate, excluded map[string]bool) []RuntimeFileTarget {
+	if len(files) == 0 {
+		return nil
+	}
+
+	targets := make([]RuntimeFileTarget, 0, len(instances))
+	for _, instance := range instances {
+		if instance.Status == state.StatusMissing || excluded[instance.WorktreePath] {
+			continue
+		}
+		missing := missingRuntimeFiles(instance.WorktreePath, files)
+		if len(missing) == 0 {
+			continue
+		}
+		targets = append(targets, RuntimeFileTarget{
+			InstanceName: instance.Name,
+			WorktreePath: instance.WorktreePath,
+			RuntimeFiles: missing,
+		})
+	}
+	return targets
+}
+
+func applyRuntimeFileDecisions(candidate WorktreeCandidate, decisions []RuntimeFileDecision) error {
+	if len(decisions) == 0 {
+		return nil
+	}
+
+	filesByPath := make(map[string]RuntimeFileCandidate, len(candidate.RuntimeFiles))
+	for _, file := range candidate.RuntimeFiles {
+		filesByPath[file.Path] = file
+	}
+	for _, decision := range decisions {
+		if decision.Action == "" || decision.Action == RuntimeFileSkip {
+			continue
+		}
+		file, ok := filesByPath[decision.Path]
+		if !ok {
+			return fmt.Errorf("unknown runtime file %s for worktree %s", decision.Path, candidate.WorktreePath)
+		}
+		if err := applyRuntimeFileDecision(file, decision.Action); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func applyRuntimeFileDecision(file RuntimeFileCandidate, action RuntimeFileAction) error {
+	if err := validateRuntimeFileCandidate(file); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(file.TargetPath); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat runtime file target %s: %w", file.TargetPath, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(file.TargetPath), 0o755); err != nil {
+		return fmt.Errorf("create runtime file directory: %w", err)
+	}
+
+	switch action {
+	case RuntimeFileSymlink:
+		if err := os.Symlink(file.SourcePath, file.TargetPath); err != nil {
+			return fmt.Errorf("link runtime file %s: %w", file.Path, err)
+		}
+	case RuntimeFileCopy:
+		if err := copyRuntimeFile(file.SourcePath, file.TargetPath); err != nil {
+			return fmt.Errorf("copy runtime file %s: %w", file.Path, err)
+		}
+	default:
+		return fmt.Errorf("unsupported runtime file action %q", action)
+	}
+	return nil
+}
+
+func validateRuntimeFileCandidate(file RuntimeFileCandidate) error {
+	if strings.TrimSpace(file.Path) == "" {
+		return errors.New("runtime file path is required")
+	}
+	if filepath.IsAbs(file.Path) || filepath.Clean(file.Path) != file.Path || strings.HasPrefix(file.Path, "..") {
+		return fmt.Errorf("invalid runtime file path %s", file.Path)
+	}
+	if strings.TrimSpace(file.SourcePath) == "" || strings.TrimSpace(file.TargetPath) == "" {
+		return fmt.Errorf("runtime file %s has invalid source or target", file.Path)
+	}
+	return nil
+}
+
+func copyRuntimeFile(sourcePath, targetPath string) error {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+
+	info, err := source.Stat()
+	if err != nil {
+		return err
+	}
+	target, err := os.OpenFile(targetPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	defer target.Close()
+
+	_, err = io.Copy(target, source)
+	return err
 }
 
 func (s Service) loadProject(startDir string) (ProjectContext, *state.Store, error) {
@@ -596,6 +926,10 @@ func uniqueName(base string, used map[string]bool) string {
 			return candidate
 		}
 	}
+}
+
+func reservedInstanceNameSet() map[string]bool {
+	return map[string]bool{AllInstancesTarget: true}
 }
 
 func sortedNames(used map[string]bool) []string {

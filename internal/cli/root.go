@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -48,6 +49,7 @@ func NewRootCommand() *cobra.Command {
 	rootCmd.AddCommand(newListCommand(service))
 	rootCmd.AddCommand(newPruneCommand(service))
 	rootCmd.AddCommand(newUpCommand(service))
+	rootCmd.AddCommand(newRunCommand(service))
 	rootCmd.AddCommand(newDownCommand(service))
 	rootCmd.AddCommand(newRestartCommand(service))
 	rootCmd.AddCommand(newLogsCommand(service))
@@ -247,6 +249,25 @@ func newListCommand(service app.Service) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			imported := result.Imported
+			if interactive && len(result.RuntimeFileTargets) > 0 {
+				decisions, err := promptManagedRuntimeFileHandling(result.RuntimeFileTargets)
+				if err != nil {
+					return err
+				}
+				configured, err := service.ConfigureRuntimeFiles(mustGetwd(), decisions)
+				if err != nil {
+					return err
+				}
+				if len(configured) > 0 {
+					fmt.Fprintf(cmd.OutOrStdout(), "configured runtime files for %d instance%s\n\n", len(configured), pluralS(len(configured)))
+					result, err = service.Inventory(mustGetwd(), includeIgnored, false, nil)
+					if err != nil {
+						return err
+					}
+					result.Imported = imported
+				}
+			}
 
 			out := cmd.OutOrStdout()
 			if len(result.Imported) > 0 {
@@ -305,11 +326,14 @@ func newPruneCommand(service app.Service) *cobra.Command {
 
 func newUpCommand(service app.Service) *cobra.Command {
 	return &cobra.Command{
-		Use:     "up <instance>",
+		Use:     "up <instance|all>",
 		Aliases: []string{"start"},
 		Short:   "Start a runtree instance",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if isAllInstancesTarget(args[0]) {
+				return startAllInstances(cmd, service)
+			}
 			instance, err := service.StartInstance(mustGetwd(), args[0])
 			if err != nil {
 				return err
@@ -320,13 +344,32 @@ func newUpCommand(service app.Service) *cobra.Command {
 	}
 }
 
+func newRunCommand(service app.Service) *cobra.Command {
+	return &cobra.Command{
+		Use:   "run <instance> -- <command> [args...]",
+		Short: "Run a command in an instance worktree",
+		Args:  cobra.MinimumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return service.RunInInstance(mustGetwd(), args[0], app.RunCommandInput{
+				Args:   args[1:],
+				Stdin:  cmd.InOrStdin(),
+				Stdout: cmd.OutOrStdout(),
+				Stderr: cmd.ErrOrStderr(),
+			})
+		},
+	}
+}
+
 func newDownCommand(service app.Service) *cobra.Command {
 	return &cobra.Command{
-		Use:     "down <instance>",
+		Use:     "down <instance|all>",
 		Aliases: []string{"stop"},
 		Short:   "Stop a runtree instance",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if isAllInstancesTarget(args[0]) {
+				return stopAllInstances(cmd, service)
+			}
 			instance, err := service.StopInstance(mustGetwd(), args[0])
 			if err != nil {
 				return err
@@ -339,10 +382,13 @@ func newDownCommand(service app.Service) *cobra.Command {
 
 func newRestartCommand(service app.Service) *cobra.Command {
 	return &cobra.Command{
-		Use:   "restart <instance>",
+		Use:   "restart <instance|all>",
 		Short: "Restart a runtree instance",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if isAllInstancesTarget(args[0]) {
+				return restartAllInstances(cmd, service)
+			}
 			instance, err := service.RestartInstance(mustGetwd(), args[0])
 			if err != nil {
 				return err
@@ -351,6 +397,90 @@ func newRestartCommand(service app.Service) *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func isAllInstancesTarget(target string) bool {
+	return app.IsReservedInstanceName(target)
+}
+
+func startAllInstances(cmd *cobra.Command, service app.Service) error {
+	return runAllInstances(cmd, service, "start", func(instance state.Instance) (state.Instance, bool, string, error) {
+		switch instance.Status {
+		case state.StatusMissing:
+			return instance, true, "missing worktree", nil
+		case state.StatusRunning:
+			return instance, true, fmt.Sprintf("already running on http://127.0.0.1:%d (pid %d)", instance.Port, instance.PID), nil
+		default:
+			started, err := service.StartInstance(mustGetwd(), instance.Name)
+			return started, false, "", err
+		}
+	}, func(instance state.Instance) string {
+		return fmt.Sprintf("running %s on http://127.0.0.1:%d (pid %d)", instance.Name, instance.Port, instance.PID)
+	})
+}
+
+func stopAllInstances(cmd *cobra.Command, service app.Service) error {
+	return runAllInstances(cmd, service, "stop", func(instance state.Instance) (state.Instance, bool, string, error) {
+		switch instance.Status {
+		case state.StatusMissing:
+			return instance, true, "missing worktree", nil
+		case state.StatusStopped:
+			return instance, true, "already stopped", nil
+		default:
+			stopped, err := service.StopInstance(mustGetwd(), instance.Name)
+			return stopped, false, "", err
+		}
+	}, func(instance state.Instance) string {
+		return fmt.Sprintf("stopped %s", instance.Name)
+	})
+}
+
+func restartAllInstances(cmd *cobra.Command, service app.Service) error {
+	return runAllInstances(cmd, service, "restart", func(instance state.Instance) (state.Instance, bool, string, error) {
+		if instance.Status == state.StatusMissing {
+			return instance, true, "missing worktree", nil
+		}
+		restarted, err := service.RestartInstance(mustGetwd(), instance.Name)
+		return restarted, false, "", err
+	}, func(instance state.Instance) string {
+		return fmt.Sprintf("restarted %s on http://127.0.0.1:%d (pid %d)", instance.Name, instance.Port, instance.PID)
+	})
+}
+
+func runAllInstances(
+	cmd *cobra.Command,
+	service app.Service,
+	action string,
+	run func(state.Instance) (state.Instance, bool, string, error),
+	formatSuccess func(state.Instance) string,
+) error {
+	instances, err := service.ListInstances(mustGetwd(), false)
+	if err != nil {
+		return err
+	}
+	if len(instances) == 0 {
+		fmt.Fprintln(cmd.OutOrStdout(), "no instances")
+		return nil
+	}
+
+	failures := 0
+	for _, instance := range instances {
+		updated, skipped, reason, err := run(instance)
+		if err != nil {
+			failures++
+			fmt.Fprintf(cmd.ErrOrStderr(), "%s %s failed: %v\n", action, instance.Name, err)
+			continue
+		}
+		if skipped {
+			fmt.Fprintf(cmd.OutOrStdout(), "skipped %s (%s)\n", instance.Name, reason)
+			continue
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), formatSuccess(updated))
+	}
+	if failures > 0 {
+		return fmt.Errorf("%s all failed for %d instance%s", action, failures, pluralS(failures))
+	}
+	return nil
 }
 
 func newLogsCommand(service app.Service) *cobra.Command {
@@ -523,9 +653,13 @@ func (p surveyImportPrompter) SelectImports(candidates []app.WorktreeCandidate) 
 				Name:         candidate.SuggestedName,
 			})
 		}
-		return decisions, nil
+		return promptRuntimeFileHandling(candidates, decisions)
 	case choose:
-		return promptImportSelection(candidates)
+		decisions, err := promptImportSelection(candidates)
+		if err != nil {
+			return nil, err
+		}
+		return promptRuntimeFileHandling(candidates, decisions)
 	default:
 		return nil, nil
 	}
@@ -569,12 +703,123 @@ func promptImportSelection(candidates []app.WorktreeCandidate) ([]app.ImportDeci
 	return decisions, nil
 }
 
+func promptRuntimeFileHandling(candidates []app.WorktreeCandidate, decisions []app.ImportDecision) ([]app.ImportDecision, error) {
+	if len(decisions) == 0 {
+		return decisions, nil
+	}
+
+	candidatesByPath := make(map[string]app.WorktreeCandidate, len(candidates))
+	for _, candidate := range candidates {
+		candidatesByPath[candidate.WorktreePath] = candidate
+	}
+
+	fileSet := map[string]bool{}
+	for _, decision := range decisions {
+		candidate := candidatesByPath[decision.WorktreePath]
+		for _, file := range candidate.RuntimeFiles {
+			fileSet[file.Path] = true
+		}
+	}
+	if len(fileSet) == 0 {
+		return decisions, nil
+	}
+
+	files := make([]string, 0, len(fileSet))
+	for file := range fileSet {
+		files = append(files, file)
+	}
+	sort.Strings(files)
+
+	runtimeAction, err := promptRuntimeFileAction(fmt.Sprintf("Runtime files missing from imported worktrees (%s):", strings.Join(files, ", ")))
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range decisions {
+		candidate := candidatesByPath[decisions[i].WorktreePath]
+		for _, file := range candidate.RuntimeFiles {
+			decisions[i].RuntimeFiles = append(decisions[i].RuntimeFiles, app.RuntimeFileDecision{
+				Path:   file.Path,
+				Action: runtimeAction,
+			})
+		}
+	}
+	return decisions, nil
+}
+
+func promptManagedRuntimeFileHandling(targets []app.RuntimeFileTarget) ([]app.RuntimeFileTargetDecision, error) {
+	fileSet := map[string]bool{}
+	for _, target := range targets {
+		for _, file := range target.RuntimeFiles {
+			fileSet[file.Path] = true
+		}
+	}
+	if len(fileSet) == 0 {
+		return nil, nil
+	}
+	files := make([]string, 0, len(fileSet))
+	for file := range fileSet {
+		files = append(files, file)
+	}
+	sort.Strings(files)
+
+	runtimeAction, err := promptRuntimeFileAction(fmt.Sprintf("Managed worktrees are missing runtime files (%s):", strings.Join(files, ", ")))
+	if err != nil || runtimeAction == app.RuntimeFileSkip {
+		return nil, err
+	}
+
+	decisions := make([]app.RuntimeFileTargetDecision, 0, len(targets))
+	for _, target := range targets {
+		decision := app.RuntimeFileTargetDecision{
+			WorktreePath: target.WorktreePath,
+		}
+		for _, file := range target.RuntimeFiles {
+			decision.RuntimeFiles = append(decision.RuntimeFiles, app.RuntimeFileDecision{
+				Path:   file.Path,
+				Action: runtimeAction,
+			})
+		}
+		decisions = append(decisions, decision)
+	}
+	return decisions, nil
+}
+
+func promptRuntimeFileAction(message string) (app.RuntimeFileAction, error) {
+	const (
+		link = "Symlink from main worktree"
+		copy = "Copy into each worktree"
+		skip = "Skip"
+	)
+
+	action := link
+	if err := survey.AskOne(&survey.Select{
+		Message: message,
+		Options: []string{link, copy, skip},
+		Default: link,
+		Help:    "Symlink keeps one local env file shared across worktrees. Copy creates independent files.",
+	}, &action); err != nil {
+		return app.RuntimeFileSkip, err
+	}
+
+	switch action {
+	case link:
+		return app.RuntimeFileSymlink, nil
+	case copy:
+		return app.RuntimeFileCopy, nil
+	default:
+		return app.RuntimeFileSkip, nil
+	}
+}
+
 func promptInstanceName(candidate app.WorktreeCandidate, usedNames map[string]bool) (string, error) {
 	name := candidate.SuggestedName
 	validator := func(value any) error {
 		name := strings.TrimSpace(value.(string))
 		if name == "" {
 			return errors.New("instance name is required")
+		}
+		if app.IsReservedInstanceName(name) {
+			return fmt.Errorf("instance name %q is reserved", name)
 		}
 		if usedNames[name] {
 			return fmt.Errorf("instance name %q already exists", name)
@@ -609,16 +854,29 @@ func printInstances(out io.Writer, instances []state.Instance) error {
 func printUnmanagedWorktrees(out io.Writer, candidates []app.WorktreeCandidate) error {
 	fmt.Fprintln(out, "unmanaged worktrees:")
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "WORKTREE\tBRANCH\tSUGGESTED\tPORT")
+	fmt.Fprintln(tw, "WORKTREE\tBRANCH\tSUGGESTED\tPORT\tRUNTIME")
 	for _, candidate := range candidates {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\n",
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n",
 			candidate.WorktreePath,
 			emptyDash(candidate.Branch),
 			candidate.SuggestedName,
 			candidate.Port,
+			runtimeFileList(candidate.RuntimeFiles),
 		)
 	}
 	return tw.Flush()
+}
+
+func runtimeFileList(files []app.RuntimeFileCandidate) string {
+	if len(files) == 0 {
+		return "-"
+	}
+	names := make([]string, 0, len(files))
+	for _, file := range files {
+		names = append(names, file.Path)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ",")
 }
 
 func remainingCandidates(result app.InventoryResult) []app.WorktreeCandidate {

@@ -60,12 +60,7 @@ func (m Manager) Start(req StartRequest) (int, error) {
 
 	cmd := exec.Command("/bin/sh", "-lc", req.Command)
 	cmd.Dir = req.WorktreePath
-	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("PORT=%d", req.Port),
-		fmt.Sprintf("RUNTREE_PORT=%d", req.Port),
-		fmt.Sprintf("RUNTREE_INSTANCE=%s", req.Instance),
-		fmt.Sprintf("RUNTREE_PROJECT=%s", req.Project),
-	)
+	cmd.Env = InstanceEnv(os.Environ(), req.Project, req.Instance, req.Port)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Stdin = devNull

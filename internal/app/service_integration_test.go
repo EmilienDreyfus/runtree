@@ -1,9 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -254,6 +256,231 @@ func TestStartInstanceFailsWhenProcessExitsImmediately(t *testing.T) {
 	}
 }
 
+func TestRunInInstanceUsesWorktreeAndIsolatedEnv(t *testing.T) {
+	repoRoot := t.TempDir()
+	stateHome := filepath.Join(t.TempDir(), "state")
+
+	runGit(t, repoRoot, "init", "-b", "main")
+	runGit(t, repoRoot, "config", "user.name", "Runtree Test")
+	runGit(t, repoRoot, "config", "user.email", "runtree@example.com")
+	writeFile(t, filepath.Join(repoRoot, "README.md"), "hello\n")
+	runGit(t, repoRoot, "add", "README.md")
+	runGit(t, repoRoot, "commit", "-m", "initial")
+
+	service := NewService(stateHome)
+	service.PortChecker = func(int) bool { return true }
+	if _, err := service.InitProject(repoRoot, InitInput{
+		Name:           "runner",
+		RunCommand:     `printf "boot {port}\n"`,
+		PortStart:      8100,
+		PortEnd:        8199,
+		WebURLTemplate: "http://127.0.0.1:{port}",
+	}); err != nil {
+		t.Fatalf("InitProject() error = %v", err)
+	}
+	if _, err := service.Inventory(repoRoot, false, true, importAllPrompter{}); err != nil {
+		t.Fatalf("Inventory() error = %v", err)
+	}
+
+	activeVenv := filepath.Join(t.TempDir(), ".venv")
+	t.Setenv("VIRTUAL_ENV", activeVenv)
+	t.Setenv("POETRY_ACTIVE", "1")
+	t.Setenv("PATH", filepath.Join(activeVenv, "bin")+string(filepath.ListSeparator)+os.Getenv("PATH"))
+	t.Setenv("SECRET_KEY", "kept")
+
+	var stdout bytes.Buffer
+	err := service.RunInInstance(repoRoot, "main", RunCommandInput{
+		Args: []string{"sh", "-c", strings.Join([]string{
+			"pwd",
+			`printf "port=%s\n" "$RUNTREE_PORT"`,
+			`printf "instance=%s\n" "$RUNTREE_INSTANCE"`,
+			`printf "project=%s\n" "$RUNTREE_PROJECT"`,
+			`printf "secret=%s\n" "$SECRET_KEY"`,
+			`printf "virtual=%s\n" "${VIRTUAL_ENV:-}"`,
+			`printf "poetry=%s\n" "${POETRY_ACTIVE:-}"`,
+			`printf "path=%s\n" "$PATH"`,
+		}, "; ")},
+		Stdout: &stdout,
+	})
+	if err != nil {
+		t.Fatalf("RunInInstance() error = %v", err)
+	}
+
+	output := stdout.String()
+	canonicalRepoRoot, err := gitutil.CanonicalPath(repoRoot)
+	if err != nil {
+		t.Fatalf("CanonicalPath(%s) error = %v", repoRoot, err)
+	}
+	if !strings.Contains(output, canonicalRepoRoot+"\n") {
+		t.Fatalf("RunInInstance() output = %q, want cwd %s", output, canonicalRepoRoot)
+	}
+	for _, want := range []string{
+		"port=8100",
+		"instance=main",
+		"project=runner",
+		"secret=kept",
+		"virtual=",
+		"poetry=",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("RunInInstance() output = %q, want %q", output, want)
+		}
+	}
+	if strings.Contains(output, filepath.Join(activeVenv, "bin")) {
+		t.Fatalf("RunInInstance() leaked active venv path in output %q", output)
+	}
+}
+
+func TestInventoryCanLinkIgnoredRuntimeFilesDuringImport(t *testing.T) {
+	repoRoot := t.TempDir()
+	stateHome := filepath.Join(t.TempDir(), "state")
+
+	runGit(t, repoRoot, "init", "-b", "main")
+	runGit(t, repoRoot, "config", "user.name", "Runtree Test")
+	runGit(t, repoRoot, "config", "user.email", "runtree@example.com")
+	writeFile(t, filepath.Join(repoRoot, ".gitignore"), ".env\n.env.local\n")
+	writeFile(t, filepath.Join(repoRoot, "README.md"), "hello\n")
+	runGit(t, repoRoot, "add", ".gitignore", "README.md")
+	runGit(t, repoRoot, "commit", "-m", "initial")
+	writeFile(t, filepath.Join(repoRoot, ".env"), "SECRET_KEY=main\n")
+	writeFile(t, filepath.Join(repoRoot, ".env.local"), "DEBUG=1\n")
+
+	service := NewService(stateHome)
+	service.PortChecker = func(int) bool { return true }
+	if _, err := service.InitProject(repoRoot, InitInput{
+		Name:           "env-project",
+		RunCommand:     `printf "boot {port}\n"`,
+		PortStart:      8100,
+		PortEnd:        8199,
+		WebURLTemplate: "http://127.0.0.1:{port}",
+	}); err != nil {
+		t.Fatalf("InitProject() error = %v", err)
+	}
+
+	linkedWorktree := filepath.Join(t.TempDir(), "repo-auth")
+	runGit(t, repoRoot, "worktree", "add", linkedWorktree, "-b", "feat/auth")
+	canonicalLinkedWorktree, err := gitutil.CanonicalPath(linkedWorktree)
+	if err != nil {
+		t.Fatalf("CanonicalPath(%s) error = %v", linkedWorktree, err)
+	}
+	canonicalRepoRoot, err := gitutil.CanonicalPath(repoRoot)
+	if err != nil {
+		t.Fatalf("CanonicalPath(%s) error = %v", repoRoot, err)
+	}
+
+	discovery, err := service.Inventory(repoRoot, false, false, nil)
+	if err != nil {
+		t.Fatalf("Inventory(discovery) error = %v", err)
+	}
+	var linkedCandidate *WorktreeCandidate
+	for i := range discovery.Candidates {
+		if discovery.Candidates[i].WorktreePath == canonicalLinkedWorktree {
+			linkedCandidate = &discovery.Candidates[i]
+		}
+	}
+	if linkedCandidate == nil {
+		t.Fatalf("Inventory(discovery).Candidates = %+v, want linked worktree", discovery.Candidates)
+	}
+	if got := runtimeFilePaths(linkedCandidate.RuntimeFiles); strings.Join(got, ",") != ".env,.env.local" {
+		t.Fatalf("candidate runtime files = %v, want .env and .env.local", got)
+	}
+
+	result, err := service.Inventory(repoRoot, false, true, importPathsPrompter{
+		paths: map[string]string{
+			canonicalLinkedWorktree: "auth",
+		},
+		runtimeAction: RuntimeFileSymlink,
+	})
+	if err != nil {
+		t.Fatalf("Inventory(import) error = %v", err)
+	}
+	if len(result.Imported) != 1 {
+		t.Fatalf("Inventory(import).Imported = %d, want 1", len(result.Imported))
+	}
+
+	for _, relPath := range []string{".env", ".env.local"} {
+		target := filepath.Join(canonicalLinkedWorktree, relPath)
+		linkTarget, err := os.Readlink(target)
+		if err != nil {
+			t.Fatalf("Readlink(%s) error = %v", target, err)
+		}
+		want := filepath.Join(canonicalRepoRoot, relPath)
+		if linkTarget != want {
+			t.Fatalf("Readlink(%s) = %s, want %s", target, linkTarget, want)
+		}
+	}
+}
+
+func TestInventoryReportsManagedRuntimeFileTargets(t *testing.T) {
+	repoRoot := t.TempDir()
+	stateHome := filepath.Join(t.TempDir(), "state")
+
+	runGit(t, repoRoot, "init", "-b", "main")
+	runGit(t, repoRoot, "config", "user.name", "Runtree Test")
+	runGit(t, repoRoot, "config", "user.email", "runtree@example.com")
+	writeFile(t, filepath.Join(repoRoot, ".gitignore"), ".env\n")
+	writeFile(t, filepath.Join(repoRoot, "README.md"), "hello\n")
+	runGit(t, repoRoot, "add", ".gitignore", "README.md")
+	runGit(t, repoRoot, "commit", "-m", "initial")
+	writeFile(t, filepath.Join(repoRoot, ".env"), "SECRET_KEY=main\n")
+
+	service := NewService(stateHome)
+	service.PortChecker = func(int) bool { return true }
+	if _, err := service.InitProject(repoRoot, InitInput{
+		Name:           "managed-env",
+		RunCommand:     `printf "boot {port}\n"`,
+		PortStart:      8100,
+		PortEnd:        8199,
+		WebURLTemplate: "http://127.0.0.1:{port}",
+	}); err != nil {
+		t.Fatalf("InitProject() error = %v", err)
+	}
+
+	linkedWorktree := filepath.Join(t.TempDir(), "repo-auth")
+	runGit(t, repoRoot, "worktree", "add", linkedWorktree, "-b", "feat/auth")
+	canonicalLinkedWorktree, err := gitutil.CanonicalPath(linkedWorktree)
+	if err != nil {
+		t.Fatalf("CanonicalPath(%s) error = %v", linkedWorktree, err)
+	}
+
+	if _, err := service.Inventory(repoRoot, false, true, importPathsPrompter{
+		paths: map[string]string{
+			canonicalLinkedWorktree: "auth",
+		},
+	}); err != nil {
+		t.Fatalf("Inventory(import) error = %v", err)
+	}
+
+	result, err := service.Inventory(repoRoot, false, false, nil)
+	if err != nil {
+		t.Fatalf("Inventory(managed) error = %v", err)
+	}
+	if len(result.RuntimeFileTargets) != 1 {
+		t.Fatalf("RuntimeFileTargets = %+v, want one managed target", result.RuntimeFileTargets)
+	}
+	target := result.RuntimeFileTargets[0]
+	if target.WorktreePath != canonicalLinkedWorktree || strings.Join(runtimeFilePaths(target.RuntimeFiles), ",") != ".env" {
+		t.Fatalf("RuntimeFileTargets[0] = %+v, want auth .env target", target)
+	}
+
+	configured, err := service.ConfigureRuntimeFiles(repoRoot, []RuntimeFileTargetDecision{{
+		WorktreePath: canonicalLinkedWorktree,
+		RuntimeFiles: []RuntimeFileDecision{{
+			Path:   ".env",
+			Action: RuntimeFileSymlink,
+		}},
+	}})
+	if err != nil {
+		t.Fatalf("ConfigureRuntimeFiles() error = %v", err)
+	}
+	if len(configured) != 1 {
+		t.Fatalf("ConfigureRuntimeFiles() configured %d targets, want 1", len(configured))
+	}
+	if _, err := os.Readlink(filepath.Join(canonicalLinkedWorktree, ".env")); err != nil {
+		t.Fatalf("Readlink(.env) error = %v", err)
+	}
+}
+
 func TestInventoryImportsSelectedWorktreesOnly(t *testing.T) {
 	repoRoot := t.TempDir()
 	stateHome := filepath.Join(t.TempDir(), "state")
@@ -329,7 +556,8 @@ func (importAllPrompter) SelectImports(candidates []WorktreeCandidate) ([]Import
 }
 
 type importPathsPrompter struct {
-	paths map[string]string
+	paths         map[string]string
+	runtimeAction RuntimeFileAction
 }
 
 func (p importPathsPrompter) SelectImports(candidates []WorktreeCandidate) ([]ImportDecision, error) {
@@ -339,12 +567,28 @@ func (p importPathsPrompter) SelectImports(candidates []WorktreeCandidate) ([]Im
 		if !ok {
 			continue
 		}
-		decisions = append(decisions, ImportDecision{
+		decision := ImportDecision{
 			WorktreePath: candidate.WorktreePath,
 			Name:         name,
-		})
+		}
+		for _, file := range candidate.RuntimeFiles {
+			decision.RuntimeFiles = append(decision.RuntimeFiles, RuntimeFileDecision{
+				Path:   file.Path,
+				Action: p.runtimeAction,
+			})
+		}
+		decisions = append(decisions, decision)
 	}
 	return decisions, nil
+}
+
+func runtimeFilePaths(files []RuntimeFileCandidate) []string {
+	paths := make([]string, 0, len(files))
+	for _, file := range files {
+		paths = append(paths, file.Path)
+	}
+	sort.Strings(paths)
+	return paths
 }
 
 func runGit(t *testing.T, dir string, args ...string) string {
