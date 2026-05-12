@@ -256,6 +256,74 @@ func TestStartInstanceFailsWhenProcessExitsImmediately(t *testing.T) {
 	}
 }
 
+func TestInventoryKeepsManuallyDeletedWorktreeVisibleAsMissing(t *testing.T) {
+	repoRoot := t.TempDir()
+	stateHome := filepath.Join(t.TempDir(), "state")
+
+	runGit(t, repoRoot, "init", "-b", "main")
+	runGit(t, repoRoot, "config", "user.name", "Runtree Test")
+	runGit(t, repoRoot, "config", "user.email", "runtree@example.com")
+	writeFile(t, filepath.Join(repoRoot, "README.md"), "hello\n")
+	runGit(t, repoRoot, "add", "README.md")
+	runGit(t, repoRoot, "commit", "-m", "initial")
+
+	service := NewService(stateHome)
+	service.PortChecker = func(int) bool { return true }
+	ctx, err := service.InitProject(repoRoot, InitInput{
+		Name:           "newProject",
+		RunCommand:     `printf "boot %s\n" "{port}"`,
+		PortStart:      8100,
+		PortEnd:        8199,
+		WebURLTemplate: "http://127.0.0.1:{port}",
+	})
+	if err != nil {
+		t.Fatalf("InitProject() error = %v", err)
+	}
+
+	linkedWorktree := filepath.Join(t.TempDir(), "repo-auth")
+	runGit(t, repoRoot, "worktree", "add", linkedWorktree, "-b", "feat/auth")
+	if _, err := service.Inventory(repoRoot, false, true, importAllPrompter{}); err != nil {
+		t.Fatalf("Inventory(import) error = %v", err)
+	}
+
+	if err := os.RemoveAll(linkedWorktree); err != nil {
+		t.Fatalf("RemoveAll(%s) error = %v", linkedWorktree, err)
+	}
+
+	store, err := state.Open(stateHome)
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+	instances, err := store.InstancesByProject(ctx.Project.ID)
+	if err != nil {
+		t.Fatalf("InstancesByProject() error = %v", err)
+	}
+	authBefore := findInstance(t, instances, "auth")
+	authBefore.Status = state.StatusMissing
+	authBefore.Visibility = state.VisibilityIgnored
+	if err := store.UpdateInstance(authBefore); err != nil {
+		t.Fatalf("UpdateInstance(auth) error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("store.Close() error = %v", err)
+	}
+
+	result, err := service.Inventory(repoRoot, false, false, nil)
+	if err != nil {
+		t.Fatalf("Inventory(after manual delete) error = %v", err)
+	}
+	if len(result.Candidates) != 0 {
+		t.Fatalf("Inventory(after manual delete).Candidates = %+v, want none", result.Candidates)
+	}
+	auth := findInstance(t, result.Instances, "auth")
+	if auth.Status != state.StatusMissing {
+		t.Fatalf("auth status = %s, want %s", auth.Status, state.StatusMissing)
+	}
+	if auth.Visibility != state.VisibilityVisible {
+		t.Fatalf("auth visibility = %s, want %s", auth.Visibility, state.VisibilityVisible)
+	}
+}
+
 func TestRunInInstanceUsesWorktreeAndIsolatedEnv(t *testing.T) {
 	repoRoot := t.TempDir()
 	stateHome := filepath.Join(t.TempDir(), "state")

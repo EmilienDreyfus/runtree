@@ -221,7 +221,11 @@ func (s Service) Inventory(startDir string, includeIgnored bool, importNew bool,
 
 		if instance, ok := byPath[worktree.Path]; ok {
 			changed := false
+			worktreeExists := pathExists(worktree.Path)
 			source, visibility := classifyWorktree(worktree)
+			if !worktreeExists {
+				visibility = visibilityForKnownMissingWorktree(worktree, source)
+			}
 			if instance.Branch != worktree.Branch {
 				instance.Branch = worktree.Branch
 				changed = true
@@ -969,6 +973,19 @@ func classifyWorktree(worktree gitutil.Worktree) (string, string) {
 		return source, state.VisibilityIgnored
 	}
 	return source, state.VisibilityVisible
+}
+
+func visibilityForKnownMissingWorktree(worktree gitutil.Worktree, source string) string {
+	if worktree.Bare {
+		return state.VisibilityIgnored
+	}
+	if source == state.SourceCursor && worktree.Detached {
+		return state.VisibilityIgnored
+	}
+	if source == state.SourceClaude && worktree.Detached {
+		return state.VisibilityIgnored
+	}
+	return state.VisibilityVisible
 }
 
 func classifyWorktreeSource(worktree gitutil.Worktree) string {
