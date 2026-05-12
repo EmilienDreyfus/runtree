@@ -40,8 +40,79 @@ log() {
 }
 
 fail() {
-	log "error: $*"
+	if [ -n "${RUNTREE_SPINNER_ACTIVE:-}" ]; then
+		step_fail "error: $*"
+	else
+		log "✕ error: $*"
+	fi
 	exit 1
+}
+
+spinner_supported() {
+	[ -t 2 ] && [ "${TERM:-}" != "dumb" ]
+}
+
+spinner_cleanup() {
+	if [ -n "${RUNTREE_SPINNER_PID:-}" ]; then
+		kill "$RUNTREE_SPINNER_PID" >/dev/null 2>&1 || true
+		wait "$RUNTREE_SPINNER_PID" 2>/dev/null || true
+	fi
+	RUNTREE_SPINNER_PID=""
+	RUNTREE_SPINNER_ACTIVE=""
+}
+
+step_start() {
+	spinner_cleanup
+	RUNTREE_SPINNER_TEXT="$1"
+	RUNTREE_SPINNER_ACTIVE=1
+
+	if spinner_supported; then
+		(
+			frames='⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏'
+			while :; do
+				for frame in $frames; do
+					printf '\r\033[2K%s %s' "$frame" "$RUNTREE_SPINNER_TEXT" >&2
+					sleep 0.08
+				done
+			done
+		) &
+		RUNTREE_SPINNER_PID=$!
+	else
+		log "$RUNTREE_SPINNER_TEXT"
+	fi
+}
+
+step_finish() {
+	symbol="$1"
+	message="$2"
+
+	if [ -z "${RUNTREE_SPINNER_ACTIVE:-}" ]; then
+		log "${symbol} ${message}"
+		return
+	fi
+
+	if [ -n "${RUNTREE_SPINNER_PID:-}" ]; then
+		kill "$RUNTREE_SPINNER_PID" >/dev/null 2>&1 || true
+		wait "$RUNTREE_SPINNER_PID" 2>/dev/null || true
+		printf '\r\033[2K%s %s\n' "$symbol" "$message" >&2
+	else
+		log "${symbol} ${message}"
+	fi
+
+	RUNTREE_SPINNER_PID=""
+	RUNTREE_SPINNER_ACTIVE=""
+}
+
+step_success() {
+	step_finish "✓" "$1"
+}
+
+step_fail() {
+	step_finish "✕" "$1"
+}
+
+step_skip() {
+	step_finish "-" "$1"
 }
 
 need_cmd() {
@@ -83,7 +154,6 @@ resolve_version() {
 download() {
 	url="$1"
 	output="$2"
-	log "downloading ${url}"
 	curl -fsSL "$url" -o "$output"
 }
 
@@ -143,6 +213,7 @@ install_tunnel_helper() {
 	arch="$3"
 
 	if [ "$INSTALL_TUNNEL" = "0" ]; then
+		step_skip "skipped tunnel helper"
 		return
 	fi
 
@@ -151,14 +222,16 @@ install_tunnel_helper() {
 	tunnel_install_path="${tunnel_dir}/cloudflared"
 
 	if [ -f "${tmp_dir}/cloudflared" ]; then
+		step_start "Installing tunnel helper"
 		cp "${tmp_dir}/cloudflared" "$tunnel_install_path"
 		chmod 755 "$tunnel_install_path"
-		log "installed tunnel helper to ${tunnel_install_path}"
+		step_success "installed tunnel helper to ${tunnel_install_path}"
 		return
 	fi
 
 	asset_name=$(cloudflared_asset_name "$os" "$arch")
 	asset_url=$(cloudflared_url "$asset_name")
+	step_start "Downloading tunnel helper"
 
 	case "$asset_name" in
 		*.tgz)
@@ -176,7 +249,7 @@ install_tunnel_helper() {
 	esac
 
 	chmod 755 "$tunnel_install_path"
-	log "installed tunnel helper to ${tunnel_install_path}"
+	step_success "installed tunnel helper to ${tunnel_install_path}"
 }
 
 main() {
@@ -207,11 +280,14 @@ main() {
 	done
 
 	tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/runtree-install.XXXXXX")
-	trap 'rm -rf "$tmp_dir"' EXIT INT TERM
+	trap 'spinner_cleanup; rm -rf "$tmp_dir"' EXIT INT TERM
 
 	os=$(detect_os)
 	arch=$(detect_arch)
-	version=$(resolve_version "$tmp_dir")
+	step_start "Resolving release version"
+	version=$(resolve_version "$tmp_dir") || fail "could not resolve release version"
+	step_success "resolved ${version}"
+
 	archive_name="runtree_${version}_${os}_${arch}.tar.gz"
 	checksums_name="checksums.txt"
 	archive_url="${RELEASES_URL}/download/${version}/${archive_name}"
@@ -219,21 +295,32 @@ main() {
 	archive_path="${tmp_dir}/${archive_name}"
 	checksums_path="${tmp_dir}/${checksums_name}"
 
-	download "$checksums_url" "$checksums_path"
-	download "$archive_url" "$archive_path"
+	step_start "Downloading checksums"
+	download "$checksums_url" "$checksums_path" || fail "could not download checksums"
+	step_success "downloaded checksums"
+
+	step_start "Downloading runtree archive"
+	download "$archive_url" "$archive_path" || fail "could not download runtree archive"
+	step_success "downloaded runtree archive"
+
+	step_start "Verifying checksum"
 	verify_checksum "$checksums_path" "$archive_path" "$archive_name"
+	step_success "verified checksum"
 
-	tar -xzf "$archive_path" -C "$tmp_dir"
+	step_start "Extracting archive"
+	tar -xzf "$archive_path" -C "$tmp_dir" || fail "could not extract runtree archive"
 	[ -f "${tmp_dir}/runtree" ] || fail "archive did not contain runtree binary"
+	step_success "extracted archive"
 
+	step_start "Installing runtree"
 	mkdir -p "$INSTALL_DIR"
 	install_path="${INSTALL_DIR}/runtree"
 	cp "${tmp_dir}/runtree" "$install_path"
 	chmod 755 "$install_path"
+	step_success "installed runtree ${version} to ${install_path}"
 
 	install_tunnel_helper "$tmp_dir" "$os" "$arch"
 
-	log "installed runtree ${version} to ${install_path}"
 	"$install_path" version
 }
 

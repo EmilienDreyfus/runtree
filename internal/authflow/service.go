@@ -10,6 +10,7 @@ import (
 
 	"github.com/EmilienDreyfus/runtree/internal/authstore"
 	"github.com/EmilienDreyfus/runtree/internal/cloudapi"
+	"github.com/EmilienDreyfus/runtree/internal/termui"
 )
 
 type DeviceLoginClient interface {
@@ -24,6 +25,7 @@ type Service struct {
 	OpenBrowser func(string) error
 	SaveAuth    func(string, authstore.Auth) error
 	ClearAuth   func(string) error
+	Progress    termui.Reporter
 }
 
 func (s Service) Login(ctx context.Context, out io.Writer) (authstore.Auth, error) {
@@ -49,6 +51,11 @@ func (s Service) Login(ctx context.Context, out io.Writer) (authstore.Auth, erro
 		}
 	}
 
+	var waitStep termui.Step
+	if s.Progress != nil {
+		waitStep = s.Progress.Start("Waiting for browser approval")
+	}
+
 	pollInterval := time.Duration(startResp.PollIntervalSeconds) * time.Second
 	if pollInterval <= 0 {
 		pollInterval = 2 * time.Second
@@ -60,11 +67,13 @@ func (s Service) Login(ctx context.Context, out io.Writer) (authstore.Auth, erro
 
 	for {
 		if err := ctx.Err(); err != nil {
+			failProgress(waitStep, "login cancelled")
 			return authstore.Auth{}, err
 		}
 
 		pollResp, err := s.Client.PollDeviceLogin(ctx, startResp.DeviceCode)
 		if err != nil {
+			failProgress(waitStep, "login failed")
 			return authstore.Auth{}, err
 		}
 
@@ -76,24 +85,31 @@ func (s Service) Login(ctx context.Context, out io.Writer) (authstore.Auth, erro
 				AccountHandle: pollResp.AccountHandle,
 			}
 			if err := saveAuth(s.HomeDir, auth); err != nil {
+				failProgress(waitStep, "login failed")
 				return authstore.Auth{}, err
 			}
-			if out != nil {
+			if waitStep != nil {
+				waitStep.Success(fmt.Sprintf("logged in as %s", auth.AccountHandle))
+			} else if out != nil {
 				fmt.Fprintf(out, "logged in as %s\n", auth.AccountHandle)
 			}
 			return auth, nil
 		case "denied":
+			failProgress(waitStep, "login denied")
 			return authstore.Auth{}, errors.New("login request was denied")
 		case "expired":
+			failProgress(waitStep, "login expired")
 			return authstore.Auth{}, errors.New("login request expired")
 		}
 
 		if time.Now().After(deadline) {
+			failProgress(waitStep, "login expired")
 			return authstore.Auth{}, errors.New("login request expired")
 		}
 
 		select {
 		case <-ctx.Done():
+			failProgress(waitStep, "login cancelled")
 			return authstore.Auth{}, ctx.Err()
 		case <-time.After(pollInterval):
 		}
@@ -115,4 +131,10 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func failProgress(step termui.Step, message string) {
+	if step != nil {
+		step.Fail(message)
+	}
 }

@@ -28,6 +28,7 @@ import (
 	"github.com/EmilienDreyfus/runtree/internal/openers"
 	"github.com/EmilienDreyfus/runtree/internal/settings"
 	"github.com/EmilienDreyfus/runtree/internal/state"
+	"github.com/EmilienDreyfus/runtree/internal/termui"
 	"github.com/EmilienDreyfus/runtree/internal/tunnel"
 )
 
@@ -68,8 +69,9 @@ func newLoginCommand() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			client := cloudapi.NewClient(resolveCloudBaseURL(""), "")
 			service := authflow.Service{
-				BaseURL: resolveCloudBaseURL(""),
-				Client:  client,
+				BaseURL:  resolveCloudBaseURL(""),
+				Client:   client,
+				Progress: termui.New(cmd.OutOrStdout()),
 				OpenBrowser: func(target string) error {
 					spec, err := openers.ResolveBrowser(target)
 					if err != nil {
@@ -334,11 +336,13 @@ func newUpCommand(service app.Service) *cobra.Command {
 			if isAllInstancesTarget(args[0]) {
 				return startAllInstances(cmd, service)
 			}
+			step := termui.New(cmd.OutOrStdout()).Start(fmt.Sprintf("Starting %s", args[0]))
 			instance, err := service.StartInstance(mustGetwd(), args[0])
 			if err != nil {
+				step.Fail("start failed")
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "running %s on http://127.0.0.1:%d (pid %d)\n", instance.Name, instance.Port, instance.PID)
+			step.Success(formatRunningInstance(instance))
 			return nil
 		},
 	}
@@ -370,11 +374,13 @@ func newDownCommand(service app.Service) *cobra.Command {
 			if isAllInstancesTarget(args[0]) {
 				return stopAllInstances(cmd, service)
 			}
+			step := termui.New(cmd.OutOrStdout()).Start(fmt.Sprintf("Stopping %s", args[0]))
 			instance, err := service.StopInstance(mustGetwd(), args[0])
 			if err != nil {
+				step.Fail("stop failed")
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "stopped %s\n", instance.Name)
+			step.Success(fmt.Sprintf("stopped %s", instance.Name))
 			return nil
 		},
 	}
@@ -389,11 +395,13 @@ func newRestartCommand(service app.Service) *cobra.Command {
 			if isAllInstancesTarget(args[0]) {
 				return restartAllInstances(cmd, service)
 			}
+			step := termui.New(cmd.OutOrStdout()).Start(fmt.Sprintf("Restarting %s", args[0]))
 			instance, err := service.RestartInstance(mustGetwd(), args[0])
 			if err != nil {
+				step.Fail("restart failed")
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "restarted %s on http://127.0.0.1:%d (pid %d)\n", instance.Name, instance.Port, instance.PID)
+			step.Success(formatRestartedInstance(instance))
 			return nil
 		},
 	}
@@ -415,7 +423,7 @@ func startAllInstances(cmd *cobra.Command, service app.Service) error {
 			return started, false, "", err
 		}
 	}, func(instance state.Instance) string {
-		return fmt.Sprintf("running %s on http://127.0.0.1:%d (pid %d)", instance.Name, instance.Port, instance.PID)
+		return formatRunningInstance(instance)
 	})
 }
 
@@ -443,7 +451,7 @@ func restartAllInstances(cmd *cobra.Command, service app.Service) error {
 		restarted, err := service.RestartInstance(mustGetwd(), instance.Name)
 		return restarted, false, "", err
 	}, func(instance state.Instance) string {
-		return fmt.Sprintf("restarted %s on http://127.0.0.1:%d (pid %d)", instance.Name, instance.Port, instance.PID)
+		return formatRestartedInstance(instance)
 	})
 }
 
@@ -463,24 +471,47 @@ func runAllInstances(
 		return nil
 	}
 
+	ui := termui.New(cmd.OutOrStdout())
 	failures := 0
 	for _, instance := range instances {
+		step := ui.Start(fmt.Sprintf("%s %s", actionTitle(action), instance.Name))
 		updated, skipped, reason, err := run(instance)
 		if err != nil {
 			failures++
-			fmt.Fprintf(cmd.ErrOrStderr(), "%s %s failed: %v\n", action, instance.Name, err)
+			step.Fail(fmt.Sprintf("%s %s failed: %v", action, instance.Name, err))
 			continue
 		}
 		if skipped {
-			fmt.Fprintf(cmd.OutOrStdout(), "skipped %s (%s)\n", instance.Name, reason)
+			step.Skip(fmt.Sprintf("skipped %s (%s)", instance.Name, reason))
 			continue
 		}
-		fmt.Fprintln(cmd.OutOrStdout(), formatSuccess(updated))
+		step.Success(formatSuccess(updated))
 	}
 	if failures > 0 {
 		return fmt.Errorf("%s all failed for %d instance%s", action, failures, pluralS(failures))
 	}
 	return nil
+}
+
+func actionTitle(action string) string {
+	switch action {
+	case "start":
+		return "Starting"
+	case "stop":
+		return "Stopping"
+	case "restart":
+		return "Restarting"
+	default:
+		return strings.TrimSpace(action)
+	}
+}
+
+func formatRunningInstance(instance state.Instance) string {
+	return fmt.Sprintf("running %s on http://127.0.0.1:%d (pid %d)", instance.Name, instance.Port, instance.PID)
+}
+
+func formatRestartedInstance(instance state.Instance) string {
+	return fmt.Sprintf("restarted %s on http://127.0.0.1:%d (pid %d)", instance.Name, instance.Port, instance.PID)
 }
 
 func newLogsCommand(service app.Service) *cobra.Command {
@@ -566,16 +597,22 @@ func newExposeCommand(service app.Service) *cobra.Command {
 		Short: "Expose an instance through runtree cloud",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			ui := termui.New(cmd.OutOrStdout())
+			sessionStep := ui.Start("Checking session")
 			auth, err := authstore.Load("")
 			if err != nil {
+				sessionStep.Fail("session check failed")
 				return err
 			}
 			if strings.TrimSpace(auth.AccessToken) == "" {
+				sessionStep.Fail("session check failed")
 				return errors.New("not logged in: run `runtree login` first")
 			}
 			if _, err := tunnel.ResolveBinaryPath(""); err != nil {
+				sessionStep.Fail("session check failed")
 				return err
 			}
+			sessionStep.Success("session ready")
 
 			baseURL := resolveCloudBaseURL(auth.BaseURL)
 			client := cloudapi.NewClient(baseURL, auth.AccessToken)
@@ -584,13 +621,19 @@ func newExposeCommand(service app.Service) *cobra.Command {
 				runner.Stdout = cmd.OutOrStdout()
 				runner.Stderr = cmd.ErrOrStderr()
 			}
+			var tunnelStep termui.Step
 			controller := expose.Service{
-				App:    service,
-				Cloud:  client,
-				Runner: runner,
-				Log:    cmd.ErrOrStderr(),
+				App:      service,
+				Cloud:    client,
+				Runner:   runner,
+				Log:      cmd.ErrOrStderr(),
+				Progress: ui,
 				OnReady: func(state expose.RunState) {
 					fmt.Fprintf(cmd.OutOrStdout(), "public URL: %s\n", state.PublicURL)
+					if tunnelStep != nil {
+						tunnelStep.Stop()
+					}
+					tunnelStep = ui.Start("Tunnel running")
 				},
 			}
 
@@ -598,6 +641,13 @@ func newExposeCommand(service app.Service) *cobra.Command {
 			defer stop()
 
 			err = controller.Run(ctx, mustGetwd(), args[0])
+			if tunnelStep != nil {
+				if err == nil || errors.Is(err, context.Canceled) {
+					tunnelStep.Success("tunnel stopped")
+				} else {
+					tunnelStep.Fail("tunnel failed")
+				}
+			}
 			if err == nil || errors.Is(err, context.Canceled) {
 				return nil
 			}

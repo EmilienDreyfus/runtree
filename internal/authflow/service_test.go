@@ -9,6 +9,7 @@ import (
 
 	"github.com/EmilienDreyfus/runtree/internal/authstore"
 	"github.com/EmilienDreyfus/runtree/internal/cloudapi"
+	"github.com/EmilienDreyfus/runtree/internal/termui"
 )
 
 type fakeDeviceLoginClient struct {
@@ -69,6 +70,40 @@ func TestLoginSavesApprovedSession(t *testing.T) {
 	}
 	if loaded.AccessToken != "token-123" {
 		t.Fatalf("loaded token = %q", loaded.AccessToken)
+	}
+}
+
+func TestLoginProgressKeepsVerificationURLBeforePollingStatus(t *testing.T) {
+	t.Parallel()
+
+	client := &fakeDeviceLoginClient{
+		startResp: cloudapi.DeviceLoginStartResponse{
+			DeviceCode:          "device-123",
+			VerificationURL:     "https://runtree.dev/device",
+			ExpiresAt:           time.Now().Add(5 * time.Minute),
+			PollIntervalSeconds: 1,
+		},
+		polls: []cloudapi.DeviceLoginPollResponse{
+			{Status: "approved", AccessToken: "token-123", AccountHandle: "emilien", BaseURL: "https://runtree.dev"},
+		},
+	}
+
+	interactive := false
+	var out bytes.Buffer
+	service := Service{
+		HomeDir:  t.TempDir(),
+		Client:   client,
+		Progress: termui.NewWithOptions(&out, termui.Options{Interactive: &interactive}),
+	}
+
+	if _, err := service.Login(context.Background(), &out); err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+
+	got := out.String()
+	want := "finish sign-in in your browser:\nhttps://runtree.dev/device\nWaiting for browser approval\n✓ logged in as emilien\n"
+	if got != want {
+		t.Fatalf("Login() output = %q, want %q", got, want)
 	}
 }
 
