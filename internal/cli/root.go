@@ -301,7 +301,7 @@ func newListCommand(service app.Service) *cobra.Command {
 func newPruneCommand(service app.Service) *cobra.Command {
 	return &cobra.Command{
 		Use:   "prune",
-		Short: "Remove ignored internal instances from local runtree state",
+		Short: "Remove missing or ignored instances from local runtree state",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			result, err := service.PruneInstances(mustGetwd())
 			if err != nil {

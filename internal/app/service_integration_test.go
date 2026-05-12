@@ -191,16 +191,16 @@ func TestServiceLifecycleAcrossRealWorktrees(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PruneInstances() error = %v", err)
 	}
-	if len(pruned.Pruned) != 1 || pruned.Pruned[0].Name != "cbm" {
-		t.Fatalf("PruneInstances() = %+v, want cbm pruned", pruned)
+	if got := instanceNames(pruned.Pruned); !equalStrings(got, []string{"auth-refactor", "cbm"}) {
+		t.Fatalf("PruneInstances() pruned = %v, want auth-refactor and cbm", got)
 	}
 
 	allInstances, err = service.ListInstances(repoRoot, true)
 	if err != nil {
 		t.Fatalf("ListInstances(all after prune) error = %v", err)
 	}
-	if len(allInstances) != 2 {
-		t.Fatalf("len(allInstances after prune) = %d, want 2", len(allInstances))
+	if len(allInstances) != 1 {
+		t.Fatalf("len(allInstances after prune) = %d, want 1", len(allInstances))
 	}
 }
 
@@ -722,6 +722,26 @@ func waitFor(t *testing.T, timeout time.Duration, predicate func() bool) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatal("condition was not met before timeout")
+}
+
+func instanceNames(instances []state.Instance) []string {
+	names := make([]string, 0, len(instances))
+	for _, instance := range instances {
+		names = append(names, instance.Name)
+	}
+	return names
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func findInstance(t *testing.T, instances []state.Instance, name string) state.Instance {

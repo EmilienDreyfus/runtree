@@ -605,10 +605,10 @@ func (s Service) PruneInstances(startDir string) (PruneResult, error) {
 
 	result := PruneResult{}
 	for _, instance := range instances {
-		if instance.Visibility != state.VisibilityIgnored {
+		if !isPrunableInstance(instance) {
 			continue
 		}
-		if instance.Status == state.StatusRunning {
+		if instance.Status == state.StatusRunning || runtime.IsProcessAlive(instance.PID) {
 			result.SkippedRunning = append(result.SkippedRunning, instance)
 			continue
 		}
@@ -618,6 +618,10 @@ func (s Service) PruneInstances(startDir string) (PruneResult, error) {
 		result.Pruned = append(result.Pruned, instance)
 	}
 	return result, nil
+}
+
+func isPrunableInstance(instance state.Instance) bool {
+	return instance.Status == state.StatusMissing || instance.Visibility == state.VisibilityIgnored
 }
 
 func mainWorktreePath(worktrees []gitutil.Worktree) string {

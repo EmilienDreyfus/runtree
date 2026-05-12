@@ -210,6 +210,7 @@ Core commands:
 - `runtree logs <instance>`
 - `runtree web <instance>`
 - `runtree code <instance>`
+- `runtree prune`
 - `runtree editor`
 - `runtree version`
 
